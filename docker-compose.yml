@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  gateway-service:
+    build:
+      context: ./gateway-service
+      dockerfile: Dockerfile
+    container_name: gateway-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      - content-service
+      - translate-audio-service
+    restart: always
+
+  content-service:
+    build:
+      context: ./content-service
+      dockerfile: Dockerfile
+    container_name: content-service
+    ports:
+      - "8001:8001"
+    restart: always
+
+  translate-audio-service:
+    build:
+      context: ./translate-audio-service
+      dockerfile: Dockerfile
+    container_name: translate-audio-service
+    ports:
+      - "8002:8002"
+    restart: always
