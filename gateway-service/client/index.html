@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Thuyết Minh Tự Động Theo Tọa Độ (GPS Dubbing)</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="logo-badge">GPS Audio Guide</div>
+      <h1>Thuyết Minh Du Lịch Tự Động</h1>
+      <p class="subtitle">Tự động phát hiện di tích & địa điểm theo vị trí GPS thời gian thực</p>
+    </header>
+
+    <main class="app-main">
+      <!-- Section: Tùy chọn ngôn ngữ -->
+      <section class="card config-card">
+        <label for="lang-select" class="section-label">Ngôn ngữ thuyết minh</label>
+        <div class="select-wrapper">
+          <select id="lang-select" aria-label="Chọn ngôn ngữ thuyết minh">
+            <option value="vi" selected>🇻🇳 Tiếng Việt</option>
+            <option value="en">🇬🇧 English</option>
+            <option value="ja">🇯🇵 日本語</option>
+          </select>
+        </div>
+      </section>
+
+      <!-- Section: Nút điều khiển -->
+      <section class="control-actions">
+        <button id="btn-start" class="btn btn-primary" type="button">
+          <span class="btn-icon">▶</span> Bắt đầu thuyết minh
+        </button>
+        <button id="btn-stop" class="btn btn-danger" type="button" disabled>
+          <span class="btn-icon">⏹</span> Dừng GPS
+        </button>
+      </section>
+
+      <!-- Section: Trạng thái hệ thống -->
+      <section class="card status-card">
+        <h2 class="card-title">Trạng thái hệ thống</h2>
+        <div class="status-grid">
+          <div class="status-item">
+            <span class="status-label">Định vị GPS:</span>
+            <span id="gps-status" class="status-value badge badge-neutral">Chưa bật</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Kết nối Gateway:</span>
+            <span id="api-status" class="status-value badge badge-neutral">Sẵn sàng</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Tọa độ:</span>
+            <span id="coords-display" class="status-value mono">--</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Độ chính xác:</span>
+            <span id="accuracy-display" class="status-value mono">--</span>
+          </div>
+          <div class="status-item full-width">
+            <span class="status-label">Cập nhật lúc:</span>
+            <span id="timestamp-display" class="status-value">--</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section: Thông tin phát hiện địa điểm -->
+      <section class="card detection-card">
+        <h2 class="card-title">Địa điểm hiện tại</h2>
+        
+        <div id="no-detect-box" class="info-banner">
+          Chưa có địa điểm nào được phát hiện trong phạm vi kích hoạt.
+        </div>
+
+        <div id="detected-content" class="detected-box hidden">
+          <div class="place-header">
+            <h3 id="place-name" class="place-title">--</h3>
+            <span id="activation-badge" class="badge badge-success">Trong bán kính</span>
+          </div>
+
+          <div class="place-meta">
+            <div class="meta-row">
+              <span class="meta-key">Khoảng cách:</span>
+              <span id="place-distance" class="meta-val highlight">--</span>
+            </div>
+            <div class="meta-row">
+              <span class="meta-key">Nguồn dữ liệu:</span>
+              <span id="place-source" class="meta-val">--</span>
+            </div>
+            <div class="meta-row" id="source-link-row">
+              <span class="meta-key">Bài viết gốc:</span>
+              <a id="place-url" href="#" target="_blank" rel="noopener noreferrer" class="link">Xem liên kết</a>
+            </div>
+            <div class="meta-row">
+              <span class="meta-key">Trạng thái thuyết minh:</span>
+              <span id="narration-status" class="meta-val badge badge-info">--</span>
+            </div>
+          </div>
+
+          <div class="narration-preview">
+            <h4>Mô tả sơ lược:</h4>
+            <p id="place-desc" class="desc-text">--</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section: Debug candidates lân cận (nếu có) -->
+      <section class="card debug-card">
+        <details>
+          <summary>Ứng viên lân cận (Debug & Giám sát)</summary>
+          <div id="candidates-list" class="candidates-container">
+            <p class="empty-note">Chưa có dữ liệu ứng viên.</p>
+          </div>
+        </details>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>Hệ thống Thuyết Minh Đa Ngôn Ngữ Tuần 3 • Chạy foreground trên trình duyệt di động</p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
