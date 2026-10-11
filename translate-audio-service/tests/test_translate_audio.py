@@ -527,3 +527,362 @@ def test_localized_en_to_vi_success(mock_langlink, mock_extract):
     assert data["lang"] == "vi"
     # Khong duoc gan nhan "en" cho text tieng Viet
     assert data["lang"] != "en"
+
+
+# ===========================================================================
+# TUẦN 4 — UNIT TESTS CHO EDGE TTS & AUDIO CACHE (MOCK TOÀN BỘ)
+# Không gọi Microsoft Edge hoặc Wikimedia thật trong pytest/CI.
+# ===========================================================================
+
+import asyncio
+import httpx
+import tts
+
+
+class MockEdgeCommunicate:
+    """Mock edge_tts.Communicate để tạo file MP3 giả lập trong unit tests."""
+
+    def __init__(self, text: str, voice: str):
+        self.text = text
+        self.voice = voice
+
+    async def save(self, filepath: str):
+        with open(filepath, "wb") as f:
+            f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_AUDIO_PAYLOAD")
+
+
+def test_tts_create_mp3_success(tmp_path, monkeypatch):
+    """Tạo MP3 thành công: trả 200, cache_hit=False, file tồn tại trên đĩa."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", MockEdgeCommunicate)
+
+    req_body = {
+        "text": "Nhà thờ Đức Bà là công trình kiến trúc nổi tiếng tại TP.HCM.",
+        "lang": "vi",
+    }
+    resp = client.post("/text-to-speech", json=req_body)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["lang"] == "vi"
+    assert data["voice"] == "vi-VN-HoaiMyNeural"
+    assert len(data["text_hash"]) == 64
+    assert data["audio_filename"].endswith(".mp3")
+    assert data["audio_url"] == f"/audio/{data['audio_filename']}"
+    assert data["cache_hit"] is False
+
+    # Kiểm tra file vật lý tồn tại và có kích thước > 0
+    file_on_disk = tmp_path / data["audio_filename"]
+    assert file_on_disk.is_file()
+    assert file_on_disk.stat().st_size > 0
+
+
+def test_tts_cache_hit_second_request(tmp_path, monkeypatch):
+    """File hit: gọi lần hai với cùng nội dung trả cache_hit=True, không gọi lại TTS."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    call_count = 0
+
+    class CountingMockCommunicate:
+        def __init__(self, text: str, voice: str):
+            self.text = text
+            self.voice = voice
+
+        async def save(self, filepath: str):
+            nonlocal call_count
+            call_count += 1
+            with open(filepath, "wb") as f:
+                f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_AUDIO_PAYLOAD")
+
+    monkeypatch.setattr("edge_tts.Communicate", CountingMockCommunicate)
+
+    req_body = {"text": "Chợ Bến Thành là chợ lịch sử.", "lang": "vi"}
+
+    # Lần 1: cache miss
+    resp1 = client.post("/text-to-speech", json=req_body)
+    assert resp1.status_code == 200
+    assert resp1.json()["cache_hit"] is False
+    assert call_count == 1
+
+    # Lần 2: cache hit
+    resp2 = client.post("/text-to-speech", json=req_body)
+    assert resp2.status_code == 200
+    assert resp2.json()["cache_hit"] is True
+    assert resp2.json()["audio_filename"] == resp1.json()["audio_filename"]
+    # Mock save không được gọi lần 2
+    assert call_count == 1
+
+
+def test_tts_file_lost_regenerates_no_fake_cache_hit(tmp_path, monkeypatch):
+    """File mất: xóa file vật lý -> gọi lại phải tạo lại, KHÔNG trả cache_hit giả."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    call_count = 0
+
+    class CountingMockCommunicate:
+        def __init__(self, text: str, voice: str):
+            self.text = text
+            self.voice = voice
+
+        async def save(self, filepath: str):
+            nonlocal call_count
+            call_count += 1
+            with open(filepath, "wb") as f:
+                f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_AUDIO_PAYLOAD")
+
+    monkeypatch.setattr("edge_tts.Communicate", CountingMockCommunicate)
+
+    req_body = {"text": "Hồ Hoàn Kiếm nằm ở trung tâm Hà Nội.", "lang": "vi"}
+
+    # Lần 1: tạo file thành công
+    resp1 = client.post("/text-to-speech", json=req_body)
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+    assert data1["cache_hit"] is False
+    assert call_count == 1
+
+    file_path = tmp_path / data1["audio_filename"]
+    assert file_path.is_file()
+
+    # Giả lập file bị xóa / mất trên đĩa
+    file_path.unlink()
+    assert not file_path.is_file()
+
+    # Lần 2: hệ thống PHẢI phát hiện file mất và tạo lại, cache_hit=False
+    resp2 = client.post("/text-to-speech", json=req_body)
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["cache_hit"] is False  # Không được trả cache_hit giả!
+    assert call_count == 2
+    assert file_path.is_file()
+    assert file_path.stat().st_size > 0
+
+
+@pytest.mark.anyio
+async def test_tts_concurrent_requests_same_key(tmp_path, monkeypatch):
+    """Hai request đồng thời cùng 1 key: khóa theo key ngăn gọi TTS trùng lặp."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    call_count = 0
+
+    class SlowMockCommunicate:
+        def __init__(self, text: str, voice: str):
+            self.text = text
+            self.voice = voice
+
+        async def save(self, filepath: str):
+            nonlocal call_count
+            call_count += 1
+            # Delay nhẹ để mô phỏng thời gian mạng
+            await asyncio.sleep(0.05)
+            with open(filepath, "wb") as f:
+                f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_AUDIO_PAYLOAD")
+
+    monkeypatch.setattr("edge_tts.Communicate", SlowMockCommunicate)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        req_body = {"text": "Chùa Một Cột được xây dựng từ thời Lý.", "lang": "vi"}
+        r1, r2 = await asyncio.gather(
+            ac.post("/text-to-speech", json=req_body),
+            ac.post("/text-to-speech", json=req_body),
+        )
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    d1 = r1.json()
+    d2 = r2.json()
+
+    # Cùng ra tên file
+    assert d1["audio_filename"] == d2["audio_filename"]
+    # Mock save chỉ được gọi đúng 1 lần duy nhất nhờ khóa đồng thời
+    assert call_count == 1
+    # Một request tạo mới, một request hit cache
+    results = [d1["cache_hit"], d2["cache_hit"]]
+    assert False in results
+    assert True in results
+
+
+def test_tts_timeout_returns_503(tmp_path, monkeypatch):
+    """Timeout khi gọi TTS: trả 503 detail.code='tts_unavailable', không crash server."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    monkeypatch.setattr(tts, "TTS_TIMEOUT_SECONDS", 0.05)
+    tts.ensure_audio_dir(tmp_path)
+
+    class TimeoutMockCommunicate:
+        def __init__(self, text: str, voice: str):
+            self.text = text
+            self.voice = voice
+
+        async def save(self, filepath: str):
+            await asyncio.sleep(0.3)
+
+    monkeypatch.setattr("edge_tts.Communicate", TimeoutMockCommunicate)
+
+    resp = client.post(
+        "/text-to-speech",
+        json={"text": "Văn bản kiểm tra quá hạn phản hồi", "lang": "vi"},
+    )
+    assert resp.status_code == 503
+    data = resp.json()
+    assert "detail" in data
+    assert data["detail"]["code"] == "tts_unavailable"
+
+    # Đảm bảo không để lại file tạm rác
+    assert len(list(tmp_path.glob("*.tmp"))) == 0
+
+
+def test_tts_unsupported_language_returns_422():
+    """Ngôn ngữ ngoài allowlist trả về HTTP 422."""
+    for unsupported in ["fr", "zh", "ko", "de", "es"]:
+        resp = client.post(
+            "/text-to-speech",
+            json={"text": "Hello world", "lang": unsupported},
+        )
+        assert resp.status_code == 422
+
+
+def test_tts_text_validation_limits():
+    """Kiểm tra validation độ dài và nội dung text: rỗng -> 422, >1200 ký tự -> 422."""
+    # Text rỗng
+    resp_empty = client.post("/text-to-speech", json={"text": "   ", "lang": "vi"})
+    assert resp_empty.status_code == 422
+
+    # Text quá 1200 ký tự
+    long_text = "A" * 1201
+    resp_long = client.post("/text-to-speech", json={"text": long_text, "lang": "vi"})
+    assert resp_long.status_code == 422
+
+    # Thiếu trường
+    resp_missing = client.post("/text-to-speech", json={"lang": "vi"})
+    assert resp_missing.status_code == 422
+
+
+def test_audio_status_valid_file_and_missing(tmp_path, monkeypatch):
+    """GET /audio/{filename}/status: file có trả exists=true, file thiếu trả exists=false."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    valid_filename = "abc123def456.mp3"
+    # Khi file chưa tồn tại -> exists=false (HTTP 200)
+    resp_missing = client.get(f"/audio/{valid_filename}/status")
+    assert resp_missing.status_code == 200
+    assert resp_missing.json() == {"exists": False}
+
+    # Tạo file thực tế
+    file_path = tmp_path / valid_filename
+    with open(file_path, "wb") as f:
+        f.write(b"AUDIO_DATA")
+
+    # Khi file đã tồn tại -> exists=true
+    resp_exists = client.get(f"/audio/{valid_filename}/status")
+    assert resp_exists.status_code == 200
+    assert resp_exists.json() == {"exists": True}
+
+
+def test_audio_status_malicious_filename_rejected(tmp_path, monkeypatch):
+    """GET /audio/{filename}/status: ngăn chặn path traversal và tên file độc hại."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    malicious_inputs = [
+        "../../etc/passwd.mp3",
+        "..%2F..%2Fetc%2Fpasswd.mp3",
+        "evil_script.sh",
+        "some_doc.txt",
+        "../secret.mp3",
+        "sub/folder.mp3",
+        "a" * 125 + ".mp3",
+    ]
+
+    for bad_name in malicious_inputs:
+        resp = client.get(f"/audio/{bad_name}/status")
+        # Phải bị từ chối 422 hoặc 404
+        assert resp.status_code in (422, 404)
+
+
+def test_audio_static_serving(tmp_path, monkeypatch):
+    """Kiểm tra phục vụ StaticFiles /audio: tải đúng nội dung file MP3."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    test_content = b"ID3\x03REAL_VERIFIED_AUDIO_CONTENT"
+
+    class CustomMockCommunicate:
+        def __init__(self, text: str, voice: str):
+            pass
+
+        async def save(self, filepath: str):
+            with open(filepath, "wb") as f:
+                f.write(test_content)
+
+    monkeypatch.setattr("edge_tts.Communicate", CustomMockCommunicate)
+
+    # Tạo audio qua API
+    create_resp = client.post(
+        "/text-to-speech",
+        json={"text": "Kiểm tra phục vụ tệp tĩnh audio", "lang": "vi"},
+    )
+    assert create_resp.status_code == 200
+    audio_filename = create_resp.json()["audio_filename"]
+    audio_url = create_resp.json()["audio_url"]
+
+    # Đọc status route trước
+    status_resp = client.get(f"/audio/{audio_filename}/status")
+    assert status_resp.status_code == 200
+    assert status_resp.json()["exists"] is True
+
+    # Tải file tĩnh qua /audio/{filename}
+    static_resp = client.get(audio_url)
+    assert static_resp.status_code == 200
+    assert "audio/mpeg" in static_resp.headers.get("content-type", "")
+    assert static_resp.content == test_content
+
+    # File không tồn tại trả 404
+    missing_resp = client.get("/audio/nonexistent_hash_123.mp3")
+    assert missing_resp.status_code == 404
+
+
+def test_tts_generic_error_returns_503(tmp_path, monkeypatch):
+    """Khi Edge TTS ném ngoại lệ bất kỳ (lỗi mạng/websocket): trả 503 code='tts_unavailable'."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    class FailingMockCommunicate:
+        def __init__(self, text: str, voice: str):
+            pass
+
+        async def save(self, filepath: str):
+            raise ConnectionError("Mất kết nối tới máy chủ Edge WebSocket")
+
+    monkeypatch.setattr("edge_tts.Communicate", FailingMockCommunicate)
+
+    resp = client.post(
+        "/text-to-speech",
+        json={"text": "Văn bản thử nghiệm lỗi kết nối", "lang": "vi"},
+    )
+    assert resp.status_code == 503
+    data = resp.json()
+    assert data["detail"]["code"] == "tts_unavailable"
+
+
+def test_tts_voice_override_via_env(tmp_path, monkeypatch):
+    """Kiểm tra khả năng override voice qua biến môi trường."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", MockEdgeCommunicate)
+
+    # Override giọng đọc tiếng Việt sang Nam Minh
+    monkeypatch.setenv("TTS_VOICE_VI", "vi-VN-NamMinhNeural")
+
+    resp = client.post(
+        "/text-to-speech",
+        json={"text": "Thử nghiệm override voice qua env", "lang": "vi"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["voice"] == "vi-VN-NamMinhNeural"
+

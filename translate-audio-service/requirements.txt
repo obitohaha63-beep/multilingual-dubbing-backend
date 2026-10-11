@@ -4,3 +4,4 @@ pytest
 httpx
 httpx2
 pydantic
+edge-tts

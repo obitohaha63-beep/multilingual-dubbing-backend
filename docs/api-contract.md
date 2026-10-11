@@ -129,9 +129,20 @@ Tìm bài Wikipedia tiếng Việt quanh tọa độ, **upsert vào CSDL**, tr�
 
 ---
 
-# 3. API Contract — translate-audio-service (Tuần 3)
+# 3. API Contract — translate-audio-service (Tuần 4)
 
-Port: `8002`. Không dùng database. Gọi Wikimedia API để lấy nội dung bản địa hóa.
+Port: `8002`. Không dùng database.
+- Lấy nội dung bản địa hóa Wikipedia qua Wikimedia API (Tuần 3).
+- Chuyển văn bản thành giọng nói MP3 qua Edge TTS với cache file bền vững (Tuần 4).
+
+## Allowlist & Voice Mapping:
+- Allowlist: `vi`, `en`, `ja`. Ngôn ngữ khác trả `422`.
+- Default Voices:
+  - `vi`: `vi-VN-HoaiMyNeural`
+  - `en`: `en-US-JennyNeural`
+  - `ja`: `ja-JP-NanamiNeural`
+- Cấu hình override qua env: `TTS_VOICE_VI`, `TTS_VOICE_EN`, `TTS_VOICE_JA`.
+- Timeout: `TTS_TIMEOUT_SECONDS` (10.0s).
 
 ## Endpoints
 
@@ -144,5 +155,32 @@ Port: `8002`. Không dùng database. Gọi Wikimedia API để lấy nội dung 
 - Body: `{"source_title": "...", "source_lang": "vi", "target_lang": "en", "source_page_id": "12345"}`
 - Dùng langlinks API của Wikimedia để lấy bài bản địa hóa viết bởi người bản ngữ (không dịch máy).
 
+### `POST /text-to-speech` *(Tuần 4 — Mới)*
+- Body: `{"text": "...", "lang": "vi"}` (tối đa 1200 ký tự; không cho phép client tự đặt filename).
+- Response (200):
+  ```json
+  {
+    "lang": "vi",
+    "voice": "vi-VN-HoaiMyNeural",
+    "text_hash": "a1b2c3...64chars",
+    "audio_filename": "f7e8d9...64chars.mp3",
+    "audio_url": "/audio/f7e8d9...64chars.mp3",
+    "cache_hit": false
+  }
+  ```
+- Cache bền vững trong `audio_files/`: key SHA256 (text chuẩn hóa + lang + voice + phiên bản TTS).
+- Khóa theo key (asyncio.Lock), atomic rename (.tmp -> .mp3), kiểm tra đĩa tránh cache_hit giả.
+- Lỗi TTS: HTTP 503 `{"detail": {"code": "tts_unavailable", "message": "..."}}`.
+
+### `GET /audio/{filename}/status` *(Tuần 4 — Mới)*
+- Đăng ký trước khi mount StaticFiles `/audio`.
+- Validate tên file chống path traversal.
+- Trả về: `{"exists": true|false}` (HTTP 200).
+
+### `GET /audio/{filename}` *(Tuần 4 — Mới, StaticFiles)*
+- Phục vụ file MP3 tĩnh từ thư mục audio cache.
+- Content-Type: `audio/mpeg`.
+
 ### `POST /translate` *(Legacy Tuần 2)*
 Giữ lại để tương thích ngược.
+
