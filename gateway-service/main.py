@@ -11,16 +11,23 @@ from __future__ import annotations
 
 import os
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, field_validator
 
 app = FastAPI(title="gateway-service")
+
+# Regex validate tên file MP3 an toàn chống path traversal
+SAFE_AUDIO_FILENAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp3$",
+    re.IGNORECASE,
+)
 
 # Đường dẫn downstream services từ biến môi trường
 CONTENT_SERVICE_URL = os.getenv("CONTENT_SERVICE_URL", "http://content-service:8001")
@@ -340,3 +347,157 @@ async def get_location_preview(id: int):
         raise HTTPException(status_code=response.status_code, detail=detail)
 
     return response.json()
+
+
+# ===========================================================================
+# Tuần 4: Proxy Stream Audio & Debug TTS Endpoint
+# ===========================================================================
+
+@app.get("/audio/{filename}")
+async def proxy_audio_stream(filename: str, request: Request):
+    """
+    Proxy stream file âm thanh MP3 từ translate-audio-service (B).
+    - Validate basename/hash chống path traversal (chỉ nhận file an toàn có đuôi .mp3).
+    - Chỉ proxy tới B đã cấu hình qua hostname TTS_SERVICE_URL, không nhận URL tùy ý.
+    - Hỗ trợ và chuyển tiếp header Range để mobile player có thể tua/seek stream.
+    - Timeout hữu hạn (GATEWAY_TIMEOUT), 404 rõ ràng khi file không tồn tại trên B.
+    - Mọi audio_url public trả về client là /audio/<filename>.mp3 cùng origin Gateway.
+    """
+    # 1. Validate an toàn tuyệt đối chống path traversal
+    if ".." in filename or "/" in filename or "\\" in filename or ":" in filename:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tên file audio không hợp lệ hoặc chứa ký tự bị cấm",
+        )
+
+    if not SAFE_AUDIO_FILENAME_RE.match(filename):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tên file audio không hợp lệ hoặc không có định dạng .mp3",
+        )
+
+    # 2. Xây dựng request forward tới B
+    target_url = f"{TTS_SERVICE_URL}/audio/{filename}"
+    req_headers: Dict[str, str] = {}
+    range_header = request.headers.get("range")
+    if range_header:
+        req_headers["range"] = range_header
+
+    client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+    try:
+        upstream_req = client.build_request("GET", target_url, headers=req_headers)
+        upstream_resp = await client.send(upstream_req, stream=True)
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        await client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Dịch vụ âm thanh tạm thời không khả dụng: {str(exc)}",
+        )
+
+    # 3. Xử lý các mã trạng thái từ B
+    if upstream_resp.status_code == 404:
+        await upstream_resp.aclose()
+        await client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File âm thanh không tồn tại trên máy chủ audio",
+        )
+
+    if upstream_resp.status_code not in (200, 206):
+        status_code = upstream_resp.status_code
+        await upstream_resp.aclose()
+        await client.aclose()
+        raise HTTPException(
+            status_code=status_code,
+            detail=f"Máy chủ audio phản hồi lỗi HTTP {status_code}",
+        )
+
+    # 4. Trích xuất headers cần thiết cho streaming và mobile range request
+    response_headers: Dict[str, str] = {
+        "Content-Type": upstream_resp.headers.get("Content-Type", "audio/mpeg"),
+        "Accept-Ranges": upstream_resp.headers.get("Accept-Ranges", "bytes"),
+    }
+    if "Content-Length" in upstream_resp.headers:
+        response_headers["Content-Length"] = upstream_resp.headers["Content-Length"]
+    if "Content-Range" in upstream_resp.headers:
+        response_headers["Content-Range"] = upstream_resp.headers["Content-Range"]
+
+    async def stream_generator():
+        try:
+            async for chunk in upstream_resp.aiter_bytes(chunk_size=16384):
+                yield chunk
+        finally:
+            await upstream_resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_generator(),
+        status_code=upstream_resp.status_code,
+        media_type=response_headers["Content-Type"],
+        headers=response_headers,
+    )
+
+
+class DebugTTSRequest(BaseModel):
+    text: str
+    lang: str
+
+    @field_validator("lang")
+    @classmethod
+    def _validate_lang(cls, v: str) -> str:
+        lang = (v or "").strip().lower()
+        if lang not in ALLOWED_LANGS:
+            raise ValueError(f"Ngôn ngữ '{v}' không được hỗ trợ. Chỉ hỗ trợ: {sorted(ALLOWED_LANGS)}")
+        return lang
+
+    @field_validator("text")
+    @classmethod
+    def _validate_text(cls, v: str) -> str:
+        text = (v or "").strip()
+        if not text:
+            raise ValueError("Văn bản không được để trống")
+        if len(text) > 1200:
+            raise ValueError("Văn bản không được vượt quá 1200 ký tự")
+        return text
+
+
+@app.post("/debug/text-to-speech")
+async def debug_text_to_speech(req: DebugTTSRequest):
+    """
+    Endpoint debug dành riêng cho việc kiểm tra audio player độc lập.
+    Gọi translate-audio-service /text-to-speech, nhận kết quả và đảm bảo
+    audio_url trả về client luôn là URL cùng origin Gateway (/audio/<filename>.mp3).
+    Tắt mặc định, không biến nhập địa điểm thành core flow.
+    """
+    target_url = f"{TTS_SERVICE_URL}/text-to-speech"
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.post(
+                target_url,
+                json={"text": req.text, "lang": req.lang},
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Quá thời gian chờ phản hồi từ dịch vụ TTS (Timeout)",
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Lỗi kết nối tới translate-audio-service: {str(exc)}",
+        )
+
+    if resp.is_error:
+        try:
+            err_data = resp.json()
+            detail = err_data.get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+
+    data = resp.json()
+    filename = data.get("audio_filename")
+    if filename:
+        # Đảm bảo audio_url là same-origin relative URL trên Gateway
+        data["audio_url"] = f"/audio/{filename}"
+    return data
