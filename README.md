@@ -119,3 +119,23 @@ services:
 6. `depends_on`: Quản lý thứ tự khởi chạy. Trong cấu hình trên, `gateway-service` sẽ chờ `content-service` và `translate-audio-service` khởi động trước.
 7. `restart: always`: Tự động khởi động lại container nếu xảy ra sự cố sập app hoặc khởi động lại máy tính.
 8. **Mạng nội bộ tự động (Docker Bridge Network)**: Khi chạy `docker-compose up`, Docker Compose sẽ tự động tạo ra 1 mạng ảo chung (Default Network). Mọi container trong file đều kết nối vào mạng này và có thể gọi tới nhau bằng tên dịch vụ (DNS resolution như `http://content-service:8001`).
+
+---
+
+## 4. Công nghệ Text-to-Speech (Edge TTS — Tuần 4)
+
+Trong `translate-audio-service` (Port 8002), tính năng chuyển văn bản thành giọng nói (`POST /text-to-speech`) được tích hợp thông qua thư viện **`edge-tts`**.
+
+### ⚠️ Lưu ý quan trọng về `edge-tts`:
+1. **Bản chất thư viện cộng đồng**:
+   - `edge-tts` là một thư viện mã nguồn mở từ cộng đồng Python, hoạt động bằng cách kết nối tới endpoint WebSocket dịch vụ "Read Aloud" của trình duyệt Microsoft Edge.
+   - **Đây KHÔNG phải là Azure Speech Services API chính thức** (không yêu cầu Azure Subscription Key hay thẻ tín dụng).
+2. **Phụ thuộc kết nối Internet (Online Dependency)**:
+   - Dịch vụ yêu cầu máy chủ/container phải có kết nối mạng Internet ra ngoài để gửi text và nhận audio stream từ máy chủ Microsoft.
+3. **Không cam kết upstream miễn phí / vĩnh viễn**:
+   - Do sử dụng endpoint nội bộ của Edge, Microsoft có thể thay đổi giao thức, hạn chế tần suất hoặc đóng endpoint bất kỳ lúc nào mà không có SLA hay cam kết duy trì dài hạn.
+   - Giải pháp này hoàn toàn phù hợp cho môi trường học tập, đồ án sinh viên và bản demo thử nghiệm (Proof of Concept).
+4. **Cơ chế Cache bền vững & Tối ưu hóa**:
+   - Hệ thống lưu trữ các file MP3 trong thư mục `audio_files/` dựa trên khóa băm SHA256 (`text_chuẩn_hóa + lang + voice + phiên_bản_TTS`).
+   - Cùng một nội dung thì tên file luôn không đổi giữa các lần định vị GPS tick, tránh tạo trùng file và giảm thiểu tối đa số lần gọi ra bên ngoài.
+   - Sử dụng khóa đồng thời (`asyncio.Lock`) và ghi đĩa nguyên tử (`atomic rename` từ file tạm sang `.mp3`) để bảo đảm an toàn dữ liệu và tốc độ phản hồi.

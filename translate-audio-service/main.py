@@ -3,9 +3,12 @@ translate-audio-service — port 8002.
 
 Tuan 2 (legacy): POST /translate — gia lap, giu lai de tuong thich.
 Tuan 3 (moi):    POST /localized-content — lay noi dung ban dia hoa tu Wikipedia.
+Tuan 4 (moi):    POST /text-to-speech — chuyen van ban thanh giong noi voi Edge TTS.
+                 GET /audio/{filename}/status — kiem tra ton tai cua file audio cache.
+                 Mount StaticFiles /audio de phuc vu cac file MP3 da tao.
 
 Khong import code xuyen thu muc (khong dung module cua content-service).
-C goi /localized-content qua HTTP, khong import truc tiep.
+C goi /localized-content va /text-to-speech qua HTTP, khong import truc tiep.
 """
 
 from __future__ import annotations
@@ -14,18 +17,22 @@ import re
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
+import tts
 import wikimedia_client
 from wikimedia_client import ALLOWED_LANGS, WikimediaError
 
 app = FastAPI(
     title="translate-audio-service",
     description=(
-        "Service dich thuat & ban dia hoa noi dung Wikipedia. "
+        "Service dich thuat, ban dia hoa noi dung va tao am thanh TTS. "
         "POST /localized-content: lay ban ban dia hoa chinh thuc tu Wikipedia. "
+        "POST /text-to-speech: chuyen van ban thanh giong noi Edge TTS (Tuan 4). "
+        "GET /audio/{filename}/status: kiem tra trang thai cache file am thanh (Tuan 4). "
         "POST /translate: giu lai de tuong thich tuan 2 (legacy, khong dung trong core flow)."
     ),
 )
@@ -34,7 +41,7 @@ app = FastAPI(
 # Pydantic schemas
 # ---------------------------------------------------------------------------
 
-MAX_CHARS = 1200  # do dai toi da tra ve
+MAX_CHARS = 1200  # do dai toi da tra ve / chap nhan
 
 
 class LocalizedContentRequest(BaseModel):
@@ -86,6 +93,48 @@ class LocalizedContentResponse(BaseModel):
     reason: Optional[str]
 
 
+# Tuần 4: Schemas cho POST /text-to-speech
+class TextToSpeechRequest(BaseModel):
+    """Body cho POST /text-to-speech."""
+
+    text: str
+    lang: str
+
+    @field_validator("lang")
+    @classmethod
+    def _validate_lang(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in ALLOWED_LANGS:
+            raise ValueError(
+                f"Ma ngon ngu '{v}' khong duoc ho tro. "
+                f"Chi chap nhan: {sorted(ALLOWED_LANGS)}"
+            )
+        return v
+
+    @field_validator("text")
+    @classmethod
+    def _validate_text(cls, v: str) -> str:
+        norm = tts.normalize_tts_text(v)
+        if not norm:
+            raise ValueError("text khong duoc de trong")
+        if len(norm) > MAX_CHARS:
+            raise ValueError(
+                f"text khong duoc vuot qua {MAX_CHARS} ky tu (nhan {len(norm)} ky tu)"
+            )
+        return norm
+
+
+class TextToSpeechResponse(BaseModel):
+    """Response cho POST /text-to-speech."""
+
+    lang: str
+    voice: str
+    text_hash: str
+    audio_filename: str
+    audio_url: str
+    cache_hit: bool
+
+
 # Legacy (Tuan 2) — giu lai de tuong thich, KHONG dung trong core flow.
 class TranslateRequest(BaseModel):
     """[LEGACY - Tuan 2] Du lieu gui len de yeu cau dich."""
@@ -101,7 +150,7 @@ class TranslateResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Utils xu ly text
+# Utils xu ly text (cho Wikimedia)
 # ---------------------------------------------------------------------------
 
 _MULTI_SPACE = re.compile(r"[ \t]+")
@@ -273,6 +322,132 @@ def localized_content(req: LocalizedContentRequest):
             status_code=503,
             content={"detail": {"code": exc.code, "message": exc.message}},
         )
+
+
+# ---------------------------------------------------------------------------
+# Tuần 4 — POST /text-to-speech (Edge TTS)
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/text-to-speech",
+    response_model=TextToSpeechResponse,
+    summary="Chuyển văn bản thành giọng nói (Tuần 4 — Edge TTS)",
+    description=(
+        "Chuyển văn bản đã đúng ngôn ngữ thành file âm thanh MP3. "
+        "Sử dụng Edge online TTS và cache bền vững trên đĩa theo hash nội dung. "
+        "Khóa đồng thời theo key để tránh tạo trùng lặp."
+    ),
+)
+async def text_to_speech(req: TextToSpeechRequest):
+    """
+    Tiếp nhận {text, lang} và trả về thông tin file âm thanh MP3.
+    - lang: ngôn ngữ thật của text ('vi', 'en', 'ja').
+    - text: chuỗi tối đa 1200 ký tự. Không cho phép người dùng tự đặt tên file.
+    - Lỗi TTS sẽ trả về HTTP 503 với detail.code='tts_unavailable', không làm sập server.
+    """
+    try:
+        result = await tts.synthesize_speech(text=req.text, lang=req.lang)
+        return JSONResponse(status_code=200, content=result)
+    except tts.UnsupportedLanguageError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+    except (tts.TTSError, tts.TTSTimeoutError) as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": "tts_unavailable",
+                    "message": str(exc),
+                }
+            },
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": "tts_unavailable",
+                    "message": f"Dịch vụ TTS gặp sự cố nội bộ: {str(exc)}",
+                }
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tuần 4 — GET /audio/{filename}/status (Kiểm tra trạng thái file cache)
+# ĐĂNG KÝ ROUTE NÀY TRƯỚC KHI MOUNT /audio StaticFiles!
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/audio/{filename}/status",
+    summary="Kiểm tra trạng thái tồn tại của file audio trong cache",
+    description=(
+        "Kiểm tra xem file audio có tồn tại trên đĩa và có dung lượng hợp lệ (> 0 bytes) hay không. "
+        "Validate filename để ngăn chặn path traversal. Route này được đăng ký trước StaticFiles /audio."
+    ),
+)
+def audio_status(filename: str):
+    """
+    Endpoint kiểm tra file cache cho Tuần 5.
+    Trả về {"exists": true|false}.
+    Nếu filename vi phạm định dạng hoặc chứa path traversal -> HTTP 422.
+    """
+    # 1. Validate định dạng tên file và ngăn chặn path traversal cơ bản
+    if not tts.validate_audio_filename(filename):
+        raise HTTPException(
+            status_code=422,
+            detail="Tên file audio không hợp lệ hoặc chứa đường dẫn không an toàn",
+        )
+
+    # 2. Ngăn chặn path traversal ở mức đường dẫn hệ thống tệp
+    try:
+        target_dir = tts.ensure_audio_dir()
+        safe_path = (target_dir / filename).resolve()
+        if safe_path.parent != target_dir.resolve():
+            raise HTTPException(
+                status_code=422,
+                detail="Path traversal detected",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Tên file không hợp lệ",
+        )
+
+    # 3. Kiểm tra file vật lý và dung lượng thực tế
+    exists = safe_path.is_file() and safe_path.stat().st_size > 0
+    return {"exists": bool(exists)}
+
+
+# ---------------------------------------------------------------------------
+# Tuần 4 — Mount StaticFiles cho /audio
+# ---------------------------------------------------------------------------
+
+
+class DynamicAudioStaticFiles(StaticFiles):
+    """
+    StaticFiles phục vụ các file âm thanh từ thư mục tts.AUDIO_DIR.
+    Tự động cập nhật thư mục tra cứu khi chạy trong môi trường test (tmp_path).
+    """
+
+    def lookup_path(self, path: str):
+        current_dir = str(tts.ensure_audio_dir())
+        self.directory = current_dir
+        self.all_directories = [current_dir]
+        return super().lookup_path(path)
+
+
+# ĐĂNG KÝ ROUTE STATUS TRƯỚC MOUNT /audio (yêu cầu Tuần 4)
+app.mount(
+    "/audio",
+    DynamicAudioStaticFiles(directory=str(tts.ensure_audio_dir())),
+    name="audio",
+)
 
 
 # ---------------------------------------------------------------------------

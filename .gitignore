@@ -23,8 +23,10 @@ content.db
 # Audio generated/cached files
 *.mp3
 *.wav
+*.tmp
 audio/
 audio_cache/
+audio_files/
 
 # OS / Editor specific
 .DS_Store
