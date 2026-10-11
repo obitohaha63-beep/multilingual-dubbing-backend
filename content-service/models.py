@@ -10,6 +10,7 @@ audio của từng địa điểm (B ghi/đọc qua REST của content-service, 
 trực tiếp file content.db).
 """
 
+import os
 from sqlalchemy import (
     create_engine,
     Column,
@@ -25,8 +26,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DB_PATH = "content.db"
-SQLALCHEMY_DATABASE_URL = f"sqlite:///./{DB_PATH}"
+DB_PATH = os.getenv("DB_PATH", "content.db")
+SQLALCHEMY_DATABASE_URL = (
+    f"sqlite:///{DB_PATH}" if os.path.isabs(DB_PATH) else f"sqlite:///./{DB_PATH}"
+)
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}

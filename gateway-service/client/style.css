@@ -342,3 +342,181 @@ body {
   color: var(--text-muted);
   padding: 8px 0;
 }
+
+/* ==========================================================================
+   Tuần 4: Audio Player & Debug Panel Styles
+   ========================================================================== */
+
+.audio-player-card {
+  border-left: 4px solid var(--primary);
+}
+
+.player-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.player-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(15, 23, 42, 0.6);
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+}
+
+.player-text-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.player-text-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.player-text-content {
+  font-size: 0.9rem;
+  color: #f1f5f9;
+  line-height: 1.4;
+  font-style: italic;
+}
+
+.player-meta-row {
+  display: flex;
+  gap: 6px;
+  font-size: 0.8rem;
+  align-items: center;
+  border-top: 1px dashed var(--card-border);
+  padding-top: 6px;
+}
+
+/* Alert Boxes (Autoplay Permission & Retry) */
+.alert-box {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.alert-warning {
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid var(--warning);
+}
+
+.alert-danger {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid var(--danger);
+}
+
+.alert-msg {
+  font-size: 0.85rem;
+  color: var(--text-main);
+  line-height: 1.3;
+}
+
+/* Player Control Buttons */
+.player-controls {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.btn-warning {
+  background-color: var(--warning);
+  color: #0f172a;
+  font-weight: 700;
+}
+
+.btn-warning:hover:not(:disabled) {
+  background-color: #d97706;
+}
+
+.btn-secondary {
+  background-color: #334155;
+  color: #f8fafc;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background-color: #475569;
+}
+
+.btn-primary-outline {
+  background-color: transparent;
+  color: var(--primary);
+  border: 1px solid var(--primary);
+}
+
+.btn-primary-outline:hover:not(:disabled) {
+  background-color: rgba(56, 189, 248, 0.15);
+}
+
+.btn-danger-outline {
+  background-color: transparent;
+  color: #fca5a5;
+  border: 1px solid var(--danger);
+}
+
+.btn-danger-outline:hover:not(:disabled) {
+  background-color: rgba(239, 68, 68, 0.15);
+}
+
+.btn-sm {
+  padding: 8px 12px;
+  font-size: 0.8rem;
+}
+
+/* Debug Mode Styles */
+.debug-panel-body {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.debug-hint {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.input-textarea {
+  width: 100%;
+  background-color: #0f172a;
+  color: var(--text-main);
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  outline: none;
+  resize: vertical;
+}
+
+.input-textarea:focus {
+  border-color: var(--primary);
+}
+
+.debug-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.debug-result-box {
+  background: #0f172a;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-family: monospace;
+  color: #a7f3d0;
+  max-height: 100px;
+  overflow-y: auto;
+  border: 1px solid var(--card-border);
+}

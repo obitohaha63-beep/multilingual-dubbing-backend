@@ -10,6 +10,8 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    volumes:
+      - ./gateway-service/client:/app/client
     depends_on:
       - content-service
       - translate-audio-service
@@ -38,7 +40,7 @@ services:
     env_file:
       - .env
     volumes:
-      - audio_cache_data:/app/audio
+      - audio_cache_data:/app/audio_files
     restart: always
 
 volumes:

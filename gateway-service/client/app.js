@@ -44,6 +44,33 @@
   const placeDesc = document.getElementById("place-desc");
   const candidatesList = document.getElementById("candidates-list");
 
+  // DOM Elements - Audio Player (Tuần 4)
+  const playerStatusBadge = document.getElementById("player-status-badge");
+  const playerText = document.getElementById("player-text");
+  const playerSource = document.getElementById("player-source");
+  const autoplayPermissionBanner = document.getElementById("autoplay-permission-banner");
+  const btnAllowPlay = document.getElementById("btn-allow-play");
+  const audioRetryBanner = document.getElementById("audio-retry-banner");
+  const audioErrorMsg = document.getElementById("audio-error-msg");
+  const btnRetryPlay = document.getElementById("btn-retry-play");
+  const btnAudioStop = document.getElementById("btn-audio-stop");
+  const btnAudioMute = document.getElementById("btn-audio-mute");
+  const btnAudioReplay = document.getElementById("btn-audio-replay");
+
+  // DOM Elements - Debug Mode (Tuần 4)
+  const debugTextInput = document.getElementById("debug-text-input");
+  const btnDebugTtsPlay = document.getElementById("btn-debug-tts-play");
+  const btnDebugTest404 = document.getElementById("btn-debug-test-404");
+  const btnDebugTestNoVoice = document.getElementById("btn-debug-test-novoice");
+  const debugApiResult = document.getElementById("debug-api-result");
+
+  // Audio Player State & Singleton Audio Element
+  const audioElement = new Audio();
+  let currentNarration = null;     // { audio_url, translated_text, lang }
+  let isMuted = false;
+  let activeAudioSource = null;    // null | 'mp3' | 'speech'
+  let availableVoices = [];
+
   // Haversine formula (meters)
   function calculateDistanceM(lat1, lon1, lat2, lon2) {
     const R = 6371000; // Radius of the Earth in meters
@@ -67,6 +94,209 @@
   function setApiStatus(text, badgeClass) {
     apiStatus.textContent = text;
     apiStatus.className = `status-value badge ${badgeClass}`;
+  }
+
+  // =========================================================================
+  // Tuần 4: Audio Player & Web Speech API Helpers
+  // =========================================================================
+
+  function setPlayerStatus(text, badgeClass) {
+    if (playerStatusBadge) {
+      playerStatusBadge.textContent = text;
+      playerStatusBadge.className = `status-value badge ${badgeClass}`;
+    }
+  }
+
+  function showPermissionBanner() {
+    if (autoplayPermissionBanner) autoplayPermissionBanner.classList.remove("hidden");
+  }
+
+  function hidePermissionBanner() {
+    if (autoplayPermissionBanner) autoplayPermissionBanner.classList.add("hidden");
+  }
+
+  function showRetryBanner(msg) {
+    if (audioErrorMsg) audioErrorMsg.textContent = msg || "Không thể phát âm thanh.";
+    if (audioRetryBanner) audioRetryBanner.classList.remove("hidden");
+  }
+
+  function hideRetryBanner() {
+    if (audioRetryBanner) audioRetryBanner.classList.add("hidden");
+  }
+
+  function loadVoices() {
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      availableVoices = window.speechSynthesis.getVoices() || [];
+    }
+  }
+
+  if (typeof window !== "undefined" && "speechSynthesis" in window) {
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    loadVoices();
+  }
+
+  function mapLangToBcp47(lang) {
+    const l = (lang || "").toLowerCase().trim();
+    if (l === "vi") return "vi-VN";
+    if (l === "en") return "en-US";
+    if (l === "ja") return "ja-JP";
+    return lang;
+  }
+
+  function findMatchingVoice(lang) {
+    loadVoices();
+    if (!availableVoices || availableVoices.length === 0) return null;
+    const bcp47 = mapLangToBcp47(lang).toLowerCase();
+    const shortLang = (lang || "").toLowerCase().split("-")[0];
+
+    // 1. Khớp chính xác mã BCP-47 (ví dụ vi-VN, en-US, ja-JP)
+    let matched = availableVoices.find(v => {
+      const vLang = (v.lang || "").toLowerCase().replace("_", "-");
+      return vLang === bcp47;
+    });
+    if (matched) return matched;
+
+    // 2. Khớp theo tiền tố ngôn ngữ (vi, en, ja)
+    matched = availableVoices.find(v => {
+      const vLang = (v.lang || "").toLowerCase().replace("_", "-");
+      return vLang.startsWith(shortLang);
+    });
+    return matched || null;
+  }
+
+  function stopCurrentAudio() {
+    if (audioElement) {
+      audioElement.pause();
+      audioElement.currentTime = 0;
+      audioElement.removeAttribute("src");
+    }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    activeAudioSource = null;
+    hidePermissionBanner();
+    setPlayerStatus("Đã dừng phát", "badge-neutral");
+    if (btnAudioStop) btnAudioStop.disabled = true;
+  }
+
+  function fallbackToSpeech(text, lang, reason) {
+    console.info(`Kích hoạt Fallback SpeechSynthesis. Lý do: ${reason}`);
+    if (audioElement) {
+      audioElement.pause();
+      audioElement.currentTime = 0;
+      audioElement.removeAttribute("src");
+    }
+
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      setPlayerStatus("Trình duyệt không hỗ trợ Web Speech", "badge-danger");
+      if (playerSource) playerSource.textContent = "Không hỗ trợ Web Speech API";
+      showRetryBanner("Trình duyệt không hỗ trợ Web Speech API.");
+      return;
+    }
+
+    loadVoices();
+    const voice = findMatchingVoice(lang);
+    if (!voice) {
+      // Khi không có voice phù hợp: hiển thị text/trạng thái, không hứa có đủ mọi ngôn ngữ, giữ nút thử lại
+      if (playerSource) playerSource.textContent = "Chỉ hiển thị văn bản (Trình duyệt chưa có voice)";
+      setPlayerStatus("Không có giọng đọc cho ngôn ngữ này trong trình duyệt", "badge-warning");
+      showRetryBanner(`Trình duyệt không có gói giọng đọc cho ngôn ngữ '${lang}'. Bạn vẫn có thể đọc bài thuyết minh bên trên.`);
+      if (btnAudioStop) btnAudioStop.disabled = true;
+      return;
+    }
+
+    if (playerSource) {
+      playerSource.textContent = `Giọng đọc trình duyệt (${voice.name || voice.lang})`;
+    }
+    setPlayerStatus("Đang phát giọng đọc trình duyệt", "badge-info");
+    hideRetryBanner();
+
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = mapLangToBcp47(lang);
+    utter.voice = voice;
+
+    utter.onstart = () => {
+      activeAudioSource = "speech";
+      if (btnAudioStop) btnAudioStop.disabled = false;
+    };
+    utter.onend = () => {
+      activeAudioSource = null;
+      setPlayerStatus("Đã phát xong", "badge-neutral");
+      if (btnAudioStop) btnAudioStop.disabled = true;
+    };
+    utter.onerror = (ev) => {
+      activeAudioSource = null;
+      console.error("SpeechSynthesis error:", ev);
+      setPlayerStatus("Lỗi phát giọng đọc trình duyệt", "badge-danger");
+      showRetryBanner("Lỗi phát giọng đọc: " + (ev.error || "Không rõ nguyên nhân"));
+      if (btnAudioStop) btnAudioStop.disabled = true;
+    };
+
+    window.speechSynthesis.speak(utter);
+  }
+
+  function playNarration({ audio_url, translated_text, lang }) {
+    // 1. Chỉ phát một narration tại một thời điểm: dừng/cancel âm thanh cũ
+    stopCurrentAudio();
+
+    currentNarration = { audio_url, translated_text, lang };
+
+    if (playerText) {
+      playerText.textContent = translated_text || "(Không có văn bản)";
+    }
+    if (btnAudioReplay) btnAudioReplay.disabled = false;
+    hidePermissionBanner();
+    hideRetryBanner();
+
+    // 2. Nếu có file audio MP3 từ Gateway (same origin)
+    if (audio_url) {
+      if (playerSource) playerSource.textContent = `File MP3 Gateway (${audio_url})`;
+      audioElement.src = audio_url;
+      audioElement.muted = isMuted;
+
+      audioElement.onended = () => {
+        activeAudioSource = null;
+        setPlayerStatus("Đã phát xong", "badge-neutral");
+        if (btnAudioStop) btnAudioStop.disabled = true;
+      };
+
+      audioElement.onerror = () => {
+        console.warn("audioElement onerror: MP3 bị 404 hoặc lỗi mạng, tự động fallback sang SpeechSynthesis.");
+        fallbackToSpeech(translated_text, lang, "File MP3 404 hoặc lỗi tải từ Gateway");
+      };
+
+      // Bắt Promise của audio.play()
+      const playPromise = audioElement.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            activeAudioSource = "mp3";
+            setPlayerStatus("Đang phát MP3", "badge-success");
+            if (btnAudioStop) btnAudioStop.disabled = false;
+            hidePermissionBanner();
+            hideRetryBanner();
+          })
+          .catch((err) => {
+            if (err.name === "NotAllowedError") {
+              // Bị chặn bởi Autoplay Policy của trình duyệt
+              // QUAN TRỌNG: Hiển thị nút 'Cho phép phát' để người dùng chạm lại, KHÔNG coi là file hỏng!
+              activeAudioSource = null;
+              setPlayerStatus("Trình duyệt chặn tự động phát (Chạm để nghe)", "badge-warning");
+              showPermissionBanner();
+              if (btnAudioStop) btnAudioStop.disabled = true;
+            } else {
+              // Lỗi khác (network, decode...) -> fallback sang SpeechSynthesis
+              fallbackToSpeech(translated_text, lang, err.message);
+            }
+          });
+      }
+    } else if (translated_text) {
+      // 3. Không có audio MP3 nhưng có văn bản -> dùng SpeechSynthesisUtterance trực tiếp
+      fallbackToSpeech(translated_text, lang, "Không có audio_url, dùng SpeechSynthesis cho văn bản");
+    } else {
+      setPlayerStatus("Không có nội dung âm thanh hoặc văn bản", "badge-neutral");
+      if (playerSource) playerSource.textContent = "--";
+    }
   }
 
   // Geolocation Success
@@ -233,6 +463,15 @@
         : (data.narration_status || "--");
 
       placeDesc.textContent = loc.description_source || loc.description_vi || "(Không có mô tả)";
+
+      // Tự động phát thuyết minh nếu detect có audio_url hoặc nội dung bài viết
+      if (data.audio_url || data.translated_text) {
+        playNarration({
+          audio_url: data.audio_url,
+          translated_text: data.translated_text || loc.description_source || loc.name,
+          lang: data.lang || langSelect.value,
+        });
+      }
     } else if (data.reason === "outside_activation_radius" && data.location) {
       // Có địa điểm lân cận nhưng ngoài activation radius
       noDetectBox.classList.add("hidden");
@@ -324,13 +563,16 @@
     lastSentFix = null;
     isRequestInFlight = false;
 
+    // Dừng luôn cả âm thanh thuyết minh đang phát
+    stopCurrentAudio();
+
     btnStart.disabled = false;
     btnStop.disabled = true;
     setGpsStatus("Đã dừng GPS", "badge-neutral");
     setApiStatus("Sẵn sàng", "badge-neutral");
   }
 
-  // Event Listeners
+  // Event Listeners: Core Tracking
   btnStart.addEventListener("click", startTracking);
   btnStop.addEventListener("click", stopTracking);
 
@@ -343,6 +585,133 @@
     }
   });
 
+  // Event Listeners: Audio Player Controls (Tuần 4)
+  if (btnAllowPlay) {
+    btnAllowPlay.addEventListener("click", () => {
+      hidePermissionBanner();
+      if (audioElement && audioElement.src) {
+        audioElement.play().then(() => {
+          activeAudioSource = "mp3";
+          setPlayerStatus("Đang phát MP3", "badge-success");
+          if (btnAudioStop) btnAudioStop.disabled = false;
+        }).catch((err) => {
+          console.warn("Chạm nút cho phép phát vẫn lỗi:", err);
+          fallbackToSpeech(currentNarration?.translated_text, currentNarration?.lang, err.message);
+        });
+      }
+    });
+  }
+
+  if (btnRetryPlay) {
+    btnRetryPlay.addEventListener("click", () => {
+      hideRetryBanner();
+      if (currentNarration) {
+        playNarration(currentNarration);
+      }
+    });
+  }
+
+  if (btnAudioStop) {
+    btnAudioStop.addEventListener("click", () => {
+      stopCurrentAudio();
+    });
+  }
+
+  if (btnAudioMute) {
+    btnAudioMute.addEventListener("click", () => {
+      isMuted = !isMuted;
+      audioElement.muted = isMuted;
+      btnAudioMute.textContent = isMuted ? "🔊 Bật tiếng" : "🔇 Tắt tiếng";
+      if (isMuted && activeAudioSource === "speech" && typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    });
+  }
+
+  if (btnAudioReplay) {
+    btnAudioReplay.addEventListener("click", () => {
+      if (currentNarration) {
+        playNarration(currentNarration);
+      }
+    });
+  }
+
+  // Event Listeners: Debug Mode Player (Tuần 4 - Tắt mặc định)
+  if (btnDebugTtsPlay) {
+    btnDebugTtsPlay.addEventListener("click", async () => {
+      const text = (debugTextInput.value || "").trim();
+      const lang = langSelect.value;
+      if (!text) {
+        alert("Vui lòng nhập văn bản kiểm tra");
+        return;
+      }
+      setPlayerStatus("Đang tạo audio qua Edge TTS...", "badge-info");
+      if (debugApiResult) {
+        debugApiResult.classList.remove("hidden");
+        debugApiResult.textContent = "Đang gửi POST /debug/text-to-speech...";
+      }
+
+      try {
+        const resp = await fetch("/debug/text-to-speech", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, lang }),
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({}));
+          throw new Error(errData.detail || `HTTP ${resp.status}`);
+        }
+        const result = await resp.json();
+        if (debugApiResult) {
+          debugApiResult.textContent = JSON.stringify(result, null, 2);
+        }
+        playNarration({
+          audio_url: result.audio_url,
+          translated_text: text,
+          lang: result.lang || lang,
+        });
+      } catch (e) {
+        console.error("Debug TTS Error:", e);
+        if (debugApiResult) {
+          debugApiResult.textContent = `Lỗi: ${e.message}`;
+        }
+        setPlayerStatus(`Lỗi TTS: ${e.message}`, "badge-danger");
+        fallbackToSpeech(text, lang, `Debug API lỗi: ${e.message}`);
+      }
+    });
+  }
+
+  if (btnDebugTest404) {
+    btnDebugTest404.addEventListener("click", () => {
+      const text = (debugTextInput.value || "").trim();
+      const lang = langSelect.value;
+      if (debugApiResult) {
+        debugApiResult.classList.remove("hidden");
+        debugApiResult.textContent = "Đang thử nghiệm phát file MP3 404 (/audio/nonexistent_test.mp3)...";
+      }
+      playNarration({
+        audio_url: "/audio/nonexistent_test.mp3",
+        translated_text: text || "Đây là bài kiểm tra fallback khi file MP3 bị 404.",
+        lang: lang,
+      });
+    });
+  }
+
+  if (btnDebugTestNoVoice) {
+    btnDebugTestNoVoice.addEventListener("click", () => {
+      const text = (debugTextInput.value || "").trim();
+      if (debugApiResult) {
+        debugApiResult.classList.remove("hidden");
+        debugApiResult.textContent = "Đang thử nghiệm Fallback khi ngôn ngữ không có Voice...";
+      }
+      playNarration({
+        audio_url: null,
+        translated_text: text || "Kiểm tra hiển thị text khi không có giọng đọc phù hợp.",
+        lang: "xx-unknown-language",
+      });
+    });
+  }
+
   // Export for testing purposes if in test environment
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
@@ -350,6 +719,12 @@
       checkAndSendDetect,
       onGpsSuccess,
       onGpsError,
+      playNarration,
+      stopCurrentAudio,
+      fallbackToSpeech,
+      findMatchingVoice,
+      mapLangToBcp47,
     };
   }
 })();
+

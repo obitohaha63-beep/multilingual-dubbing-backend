@@ -104,6 +104,82 @@
         </div>
       </section>
 
+      <!-- Section: Bảng điều khiển âm thanh thuyết minh (Tuần 4) -->
+      <section class="card audio-player-card">
+        <div class="player-header">
+          <h2 class="card-title">Âm thanh thuyết minh</h2>
+          <span id="player-status-badge" class="badge badge-neutral">Chưa phát</span>
+        </div>
+
+        <div class="player-content">
+          <div class="player-text-box">
+            <span class="player-text-label">Nội dung thuyết minh:</span>
+            <p id="player-text" class="player-text-content">Chưa có bài thuyết minh nào được phát.</p>
+          </div>
+          <div class="player-meta-row">
+            <span class="meta-key">Nguồn âm thanh:</span>
+            <span id="player-source" class="meta-val highlight">--</span>
+          </div>
+        </div>
+
+        <!-- Banner khi Autoplay bị chặn bởi chính sách trình duyệt (NotAllowedError) -->
+        <div id="autoplay-permission-banner" class="alert-box alert-warning hidden">
+          <p class="alert-msg">Trình duyệt chặn tự động phát âm thanh. Vui lòng chạm vào nút bên dưới để phát:</p>
+          <button id="btn-allow-play" class="btn btn-warning" type="button">
+            🔊 Cho phép phát âm thanh
+          </button>
+        </div>
+
+        <!-- Banner khi phát thất bại (cần thử lại thủ công) -->
+        <div id="audio-retry-banner" class="alert-box alert-danger hidden">
+          <p id="audio-error-msg" class="alert-msg">Không thể phát âm thanh.</p>
+          <button id="btn-retry-play" class="btn btn-secondary" type="button">
+            🔄 Thử lại phát âm thanh
+          </button>
+        </div>
+
+        <!-- Nút điều khiển Audio Player -->
+        <div class="player-controls">
+          <button id="btn-audio-stop" class="btn btn-danger-outline" type="button" disabled>
+            ⏹ Dừng phát
+          </button>
+          <button id="btn-audio-mute" class="btn btn-secondary" type="button">
+            🔇 Tắt tiếng
+          </button>
+          <button id="btn-audio-replay" class="btn btn-primary-outline" type="button" disabled>
+            🔁 Phát lại
+          </button>
+        </div>
+      </section>
+
+      <!-- Section: Kiểm tra Player riêng biệt (Debug Mode - Tuần 4, Tắt mặc định) -->
+      <section class="card debug-card">
+        <details id="debug-player-details">
+          <summary>🛠️ Kiểm tra Audio Player (Debug Mode - Tắt mặc định)</summary>
+          <div class="debug-panel-body">
+            <p class="debug-hint">Chế độ kiểm tra âm thanh riêng biệt gọi Edge TTS qua Gateway hoặc kiểm tra các kịch bản fallback. Không ảnh hưởng luồng GPS tự động.</p>
+            
+            <div class="form-group">
+              <label for="debug-text-input" class="section-label">Văn bản mẫu để kiểm tra:</label>
+              <textarea id="debug-text-input" rows="3" class="input-textarea" placeholder="Nhập văn bản mẫu...">Nhà thờ Đức Bà Sài Gòn là một trong những công trình kiến trúc biểu tượng nổi tiếng tại Thành phố Hồ Chí Minh.</textarea>
+            </div>
+
+            <div class="debug-actions">
+              <button id="btn-debug-tts-play" class="btn btn-primary btn-sm" type="button">
+                ▶ Tạo & Phát MP3 (/debug/text-to-speech)
+              </button>
+              <button id="btn-debug-test-404" class="btn btn-warning btn-sm" type="button">
+                🧪 Test MP3 404 (Fallback Speech)
+              </button>
+              <button id="btn-debug-test-novoice" class="btn btn-danger btn-sm" type="button">
+                🧪 Test Fallback Không có Voice
+              </button>
+            </div>
+            <div id="debug-api-result" class="debug-result-box hidden"></div>
+          </div>
+        </details>
+      </section>
+
       <!-- Section: Debug candidates lân cận (nếu có) -->
       <section class="card debug-card">
         <details>
@@ -116,10 +192,11 @@
     </main>
 
     <footer class="app-footer">
-      <p>Hệ thống Thuyết Minh Đa Ngôn Ngữ Tuần 3 • Chạy foreground trên trình duyệt di động</p>
+      <p>Hệ thống Thuyết Minh Đa Ngôn Ngữ Tuần 4 • Chạy foreground trên trình duyệt di động</p>
     </footer>
   </div>
 
   <script src="app.js"></script>
 </body>
 </html>
+

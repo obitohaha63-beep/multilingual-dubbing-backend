@@ -323,3 +323,165 @@ def test_detect_upstream_timeout_error():
         data = resp.json()
         assert data["detected"] is False
         assert data["reason"] == "upstream_unavailable"
+
+
+# ===========================================================================
+# 3. Audio Proxy & Debug TTS Tests (Tuần 4)
+# ===========================================================================
+
+class MockAsyncStreamResponse:
+    def __init__(self, status_code=200, headers=None, content=b"ID3\x03\x00\x00\x00fake-mp3-bytes"):
+        self.status_code = status_code
+        self.headers = headers or {
+            "Content-Type": "audio/mpeg",
+            "Content-Length": str(len(content)),
+            "Accept-Ranges": "bytes",
+        }
+        self.content = content
+
+    async def aiter_bytes(self, chunk_size=16384):
+        yield self.content
+
+    async def aclose(self):
+        pass
+
+
+def test_audio_proxy_success():
+    """
+    Proxy stream MP3 thành công từ translate-audio-service: HTTP 200, Content-Type audio/mpeg.
+    """
+    mock_resp = MockAsyncStreamResponse(status_code=200, content=b"fake-mp3-audio-data")
+    with patch("httpx.AsyncClient.send", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = mock_resp
+
+        resp = client.get("/audio/a1b2c3d4e5f678901234567890abcdef.mp3")
+        assert resp.status_code == 200
+        assert resp.headers["Content-Type"] == "audio/mpeg"
+        assert resp.content == b"fake-mp3-audio-data"
+        assert resp.headers.get("Accept-Ranges") == "bytes"
+
+
+def test_audio_proxy_with_range_header():
+    """
+    Proxy stream MP3 với Range header (mobile seeking / chunk streaming): forward header và trả 206 Partial Content.
+    """
+    range_headers = {
+        "Content-Type": "audio/mpeg",
+        "Content-Range": "bytes 0-499/1000",
+        "Content-Length": "500",
+        "Accept-Ranges": "bytes",
+    }
+    mock_resp = MockAsyncStreamResponse(
+        status_code=206,
+        headers=range_headers,
+        content=b"partial-mp3-bytes",
+    )
+    with patch("httpx.AsyncClient.send", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = mock_resp
+
+        resp = client.get(
+            "/audio/a1b2c3d4e5f678901234567890abcdef.mp3",
+            headers={"Range": "bytes=0-499"},
+        )
+        assert resp.status_code == 206
+        assert resp.headers["Content-Range"] == "bytes 0-499/1000"
+        assert resp.content == b"partial-mp3-bytes"
+
+
+def test_audio_proxy_404_not_found():
+    """
+    Khi file MP3 không tồn tại trên máy chủ audio (B) -> Gateway trả 404 rõ ràng.
+    """
+    mock_resp = MockAsyncStreamResponse(status_code=404)
+    with patch("httpx.AsyncClient.send", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = mock_resp
+
+        resp = client.get("/audio/nonexistent_file.mp3")
+        assert resp.status_code == 404
+        assert "không tồn tại" in resp.json()["detail"]
+
+
+def test_audio_proxy_timeout():
+    """
+    Khi gọi sang B bị timeout -> Gateway trả 503 Service Unavailable, không sập server.
+    """
+    with patch("httpx.AsyncClient.send", side_effect=httpx.ReadTimeout("Read timeout from audio service")):
+        resp = client.get("/audio/timeout_file.mp3")
+        assert resp.status_code == 503
+        assert "không khả dụng" in resp.json()["detail"]
+
+
+def test_audio_proxy_network_error():
+    """
+    Khi kết nối mạng tới B bị lỗi (ConnectError) -> Gateway trả 503.
+    """
+    with patch("httpx.AsyncClient.send", side_effect=httpx.ConnectError("Connection refused")):
+        resp = client.get("/audio/connection_error.mp3")
+        assert resp.status_code == 503
+        assert "không khả dụng" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("invalid_filename", [
+    "../../etc/passwd.mp3",
+    "..\\windows\\system32.mp3",
+    "/root/secret.mp3",
+    "test:stream.mp3",
+    "file_without_extension",
+    "script.sh",
+    "image.png",
+    "audio.wav",
+    "",
+])
+def test_audio_proxy_path_traversal_and_invalid_filenames(invalid_filename):
+    """
+    Validate chặt chẽ: ngăn chặn tuyệt đối path traversal và các file không phải .mp3 -> HTTP 422.
+    """
+    resp = client.get(f"/audio/{invalid_filename}")
+    # Nếu filename rỗng hoặc có slash có thể ra 404 (route not matched) hoặc 422
+    assert resp.status_code in (404, 422)
+
+
+def test_debug_tts_success():
+    """
+    Endpoint POST /debug/text-to-speech gọi B thành công và rewrite audio_url về same-origin Gateway (/audio/...).
+    """
+    mock_tts_data = {
+        "lang": "vi",
+        "voice": "vi-VN-HoaiMyNeural",
+        "text_hash": "a1b2c3",
+        "audio_filename": "f7e8d9.mp3",
+        "audio_url": "/audio/f7e8d9.mp3",
+        "cache_hit": False,
+    }
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.is_error = False
+        mock_resp.json.return_value = mock_tts_data
+        mock_post.return_value = mock_resp
+
+        payload = {"text": "Xin chào thế giới", "lang": "vi"}
+        resp = client.post("/debug/text-to-speech", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["audio_url"] == "/audio/f7e8d9.mp3"
+        assert data["audio_filename"] == "f7e8d9.mp3"
+
+
+def test_debug_tts_invalid_language():
+    """
+    POST /debug/text-to-speech với ngôn ngữ không hỗ trợ -> 422.
+    """
+    payload = {"text": "Bonjour", "lang": "fr"}
+    resp = client.post("/debug/text-to-speech", json=payload)
+    assert resp.status_code == 422
+
+
+def test_debug_tts_upstream_timeout():
+    """
+    POST /debug/text-to-speech gặp timeout từ B -> 503.
+    """
+    with patch("httpx.AsyncClient.post", side_effect=httpx.ReadTimeout("Timeout")):
+        payload = {"text": "Kiểm tra timeout", "lang": "vi"}
+        resp = client.post("/debug/text-to-speech", json=payload)
+        assert resp.status_code == 503
