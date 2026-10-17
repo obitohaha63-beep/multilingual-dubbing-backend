@@ -1,0 +1,6 @@
+fastapi==0.110.0
+uvicorn
+pytest
+httpx
+httpx2
+pydantic

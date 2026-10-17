@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / Caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments & Secrets
+.env
+.venv/
+venv/
+ENV/
+
+# Database files
+*.db
+*.db-journal
+*.db.bak-*
+content.db
+
+# Audio generated/cached files
+*.mp3
+*.wav
+audio/
+audio_cache/
+
+# OS / Editor specific
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
