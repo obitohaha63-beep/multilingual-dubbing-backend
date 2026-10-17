@@ -1,12 +1,11 @@
 """
-Unit tests cho translate-audio-service — Tuan 3.
+Unit tests cho translate-audio-service — Tuan 3 / 4 / 5.
 
 Chay bang lenh (tu thu muc translate-audio-service/):
     pytest tests/test_translate_audio.py -v
 
-Khong goi Wikimedia that trong unit test: dung unittest.mock.patch de
-mock wikimedia_client.get_langlink, get_extract_by_title,
-get_extract_by_pageid.
+Khong goi Wikimedia that / Edge TTS that / content-service that trong unit test:
+dung unittest.mock.patch va respx (hoac unittest.mock) de mock toan bo upstream.
 
 Test coverage:
   - GET /health
@@ -21,6 +20,21 @@ Test coverage:
       * ngon ngu khong duoc ho tro -> 422
       * 429 (rate_limited) -> 503
       * timeout -> 503
+  - POST /text-to-speech: (Tuan 4)
+      * tao MP3 thanh cong, cache hit, file mat, concurrent, timeout 503, lang 422
+  - POST /narrate: (Tuan 5)
+      * cache miss vi/en/ja thanh cong (audio_ready)
+      * cache miss ja khong co langlink -> fallback vi, is_fallback=true
+      * cache hit audio_ready (file OK) -> khong goi Wikimedia/Edge
+      * cache hit audio_ready (file mat) -> tai tao TTS
+      * cache hit text_ready -> retry TTS thanh cong -> audio_ready
+      * TTS loi sau text_ready -> tra 200 text_ready, audio_url=null
+      * content-service timeout -> 503 cache_service_unavailable
+      * PUT upsert loi -> 503 cache_upsert_failed
+      * content-service tra 404 -> 404 location_not_found
+      * concurrent cung key -> lock chong race condition
+      * audio_url la duong dan /audio/, metadata day du
+      * ngon ngu khong ho tro -> 422
 """
 
 import sys
@@ -28,12 +42,13 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from main import app, MAX_CHARS
+from main import app, MAX_CHARS, CONTENT_SERVICE_URL
 
 client = TestClient(app)
 
@@ -886,3 +901,625 @@ def test_tts_voice_override_via_env(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["voice"] == "vi-VN-NamMinhNeural"
 
+
+# ===========================================================================
+# TUẦN 5 — POST /narrate (mock A / Wikimedia / Edge)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers / fixtures cho /narrate
+# ---------------------------------------------------------------------------
+
+NARRATE_BASE_PAYLOAD = {
+    "location_id": 1,
+    "source_title": "Nhà thờ Đức Bà",
+    "source_lang": "vi",
+    "target_lang": "vi",
+    "source_text": "Nhà thờ Đức Bà Sài Gòn là công trình kiến trúc biểu tượng của thành phố.",
+    "source_page_id": "12345",
+    "source_url": "https://vi.wikipedia.org/wiki/Nh%C3%A0_th%E1%BB%9D_%C4%90%E1%BB%A9c_B%C3%A0_S%C3%A0i_G%C3%B2n",
+}
+
+
+def _make_cs_get_miss():
+    """Mock httpx.AsyncClient.get trả cache miss từ content-service."""
+    async def _get(self_or_url, url_or_kw=None, **kwargs):
+        # Khi monkeypatch instance method: (self, url, **kwargs)
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"cache_hit": False, "narration": None}
+        return r
+    return _get
+
+
+def _make_cs_put_ok():
+    """Mock httpx.AsyncClient.put trả 200 OK."""
+    async def _put(self_or_url, url_or_kw=None, **kwargs):
+        r = MagicMock()
+        r.status_code = 200
+        r.text = "{}"
+        return r
+    return _put
+
+
+def _make_cs_patch_ok():
+    """Mock httpx.AsyncClient.patch trả 200 OK."""
+    async def _patch(self_or_url, url_or_kw=None, **kwargs):
+        r = MagicMock()
+        r.status_code = 200
+        return r
+    return _patch
+
+
+class _MockCommunicateOK:
+    """Mock edge_tts.Communicate tao file MP3 gia."""
+    def __init__(self, text, voice):
+        self.text, self.voice = text, voice
+
+    async def save(self, filepath: str):
+        with open(filepath, "wb") as f:
+            f.write(b"ID3\x03\x00MOCK_MP3")
+
+
+class _MockCommunicateTimeout:
+    """Mock edge_tts.Communicate bi timeout."""
+    def __init__(self, text, voice):
+        pass
+
+    async def save(self, filepath: str):
+        import asyncio
+        await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# Test: cache miss vi -> vi thanh cong (audio_ready)
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_vi_vi_cache_miss_success(tmp_path, monkeypatch):
+    """Cache miss, vi->vi (same-lang): dung source_text, tra audio_ready."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateOK)
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["narration_status"] == "audio_ready"
+    assert data["lang"] == "vi"
+    assert data["requested_lang"] == "vi"
+    assert data["cache_hit"] is False
+    assert data["is_fallback"] is False
+    assert data["reason"] is None
+    # audio_url phai la duong dan /audio/
+    assert data["audio_url"].startswith("/audio/")
+    assert data["audio_filename"].endswith(".mp3")
+    assert len(data["text_hash"]) == 64
+    assert data["voice"] == "vi-VN-HoaiMyNeural"
+    assert data["translated_text"] != ""
+
+
+# ---------------------------------------------------------------------------
+# Test: cache miss vi -> en thanh cong
+# ---------------------------------------------------------------------------
+
+
+@patch("wikimedia_client.get_extract_by_title")
+@patch("wikimedia_client.get_langlink")
+def test_narrate_vi_en_cache_miss_success(mock_langlink, mock_extract, tmp_path, monkeypatch):
+    """Cache miss, vi->en: lay extract en tu Wikimedia, tra audio_ready."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateOK)
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    mock_langlink.return_value = "Notre-Dame Cathedral Saigon"
+    mock_extract.return_value = {
+        "title": "Notre-Dame Cathedral Saigon",
+        "extract": "Notre-Dame Cathedral Basilica of Saigon is a cathedral in Ho Chi Minh City.",
+        "url": "https://en.wikipedia.org/wiki/Notre-Dame_Cathedral_Basilica_of_Saigon",
+    }
+
+    payload = {**NARRATE_BASE_PAYLOAD, "target_lang": "en"}
+    resp = client.post("/narrate", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["narration_status"] == "audio_ready"
+    assert data["lang"] == "en"
+    assert data["requested_lang"] == "en"
+    assert data["is_fallback"] is False
+    assert data["audio_url"].startswith("/audio/")
+    assert data["voice"] == "en-US-JennyNeural"
+
+
+# ---------------------------------------------------------------------------
+# Test: cache miss vi -> ja thanh cong
+# ---------------------------------------------------------------------------
+
+
+@patch("wikimedia_client.get_extract_by_title")
+@patch("wikimedia_client.get_langlink")
+def test_narrate_vi_ja_cache_miss_success(mock_langlink, mock_extract, tmp_path, monkeypatch):
+    """Cache miss, vi->ja: lay extract ja tu Wikimedia, tra audio_ready."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateOK)
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    mock_langlink.return_value = "サイゴン大教会"
+    mock_extract.return_value = {
+        "title": "サイゴン大教会",
+        "extract": "サイゴン大教会はベトナム最大の都市ホーチミン市にあるカトリックの大聖堂。",
+        "url": "https://ja.wikipedia.org/wiki/%E3%82%B5%E3%82%A4%E3%82%B4%E3%83%B3%E5%A4%A7%E6%95%99%E4%BC%9A",
+    }
+
+    payload = {**NARRATE_BASE_PAYLOAD, "target_lang": "ja"}
+    resp = client.post("/narrate", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["narration_status"] == "audio_ready"
+    assert data["lang"] == "ja"
+    assert data["voice"] == "ja-JP-NanamiNeural"
+    assert data["is_fallback"] is False
+
+
+# ---------------------------------------------------------------------------
+# Test: thieu ja langlink -> fallback vi, is_fallback=True
+# ---------------------------------------------------------------------------
+
+
+@patch("wikimedia_client.get_langlink")
+def test_narrate_ja_missing_langlink_fallback_vi(
+    mock_langlink, tmp_path, monkeypatch
+):
+    """vi->ja nhung khong co langlink -> fallback source_text vi, is_fallback=True."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateOK)
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    mock_langlink.return_value = None  # khong co langlink sang ja
+
+    payload = {**NARRATE_BASE_PAYLOAD, "target_lang": "ja"}
+    resp = client.post("/narrate", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # lang la ngon ngu thuc te = vi (fallback), requested_lang = ja
+    assert data["requested_lang"] == "ja"
+    assert data["lang"] == "vi"  # fallback sang vi
+    assert data["is_fallback"] is True
+    assert data["reason"] == "target_language_unavailable"
+    assert data["narration_status"] == "audio_ready"
+    assert data["voice"] == "vi-VN-HoaiMyNeural"
+    # text la source_text, khong gan nhan ngon ngu sai
+    assert "Nhà thờ" in data["translated_text"]
+
+
+# ---------------------------------------------------------------------------
+# Test: cache hit audio_ready, file OK -> khong goi Wikimedia/Edge
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_cache_hit_audio_ready_file_ok_no_upstream(
+    tmp_path, monkeypatch
+):
+    """audio_ready cache hit + file ton tai -> tra ngay, khong goi Wikimedia/Edge."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    # Tao file MP3 gia de gia lap file ton tai
+    fake_filename = "a" * 64 + ".mp3"
+    (tmp_path / fake_filename).write_bytes(b"ID3\x03\x00MOCK")
+
+    tts_called = [0]
+
+    class _TrackingCommunicate:
+        def __init__(self, text, voice):
+            tts_called[0] += 1
+
+        async def save(self, filepath):
+            tts_called[0] += 1
+
+    monkeypatch.setattr("edge_tts.Communicate", _TrackingCommunicate)
+
+    import main as _main
+
+    async def _cs_get_audio_ready(self_or_url, url_or_kw=None, **kwargs):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {
+            "cache_hit": True,
+            "narration": {
+                "audio_status": "audio_ready",
+                "audio_filename": fake_filename,
+                "lang": "vi",
+                "text": "Nhà thờ Đức Bà.",
+                "voice": "vi-VN-HoaiMyNeural",
+                "text_hash": "a" * 64,
+                "source_url": "https://vi.wikipedia.org/",
+                "is_fallback": False,
+                "reason": None,
+            },
+        }
+        return r
+
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _cs_get_audio_ready)
+    # PUT va PATCH khong duoc goi
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["narration_status"] == "audio_ready"
+    assert data["cache_hit"] is True
+    assert data["audio_url"] == f"/audio/{fake_filename}"
+    # TTS khong duoc goi
+    assert tts_called[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Test: cache hit audio_ready nhung file mat -> tai tao TTS
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_cache_hit_audio_ready_file_missing_regenerates(
+    tmp_path, monkeypatch
+):
+    """audio_ready cache hit nhung file MP3 mat -> tai tao, cache_hit=False."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateOK)
+
+    fake_filename = "b" * 64 + ".mp3"
+    # File KHONG ton tai
+    assert not (tmp_path / fake_filename).exists()
+
+    import main as _main
+
+    async def _cs_get_audio_ready_missing_file(self_or_url, url_or_kw=None, **kwargs):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {
+            "cache_hit": True,
+            "narration": {
+                "audio_status": "audio_ready",
+                "audio_filename": fake_filename,
+                "lang": "vi",
+                "text": "Nhà thờ Đức Bà Sài Gòn là công trình kiến trúc.",
+                "voice": "vi-VN-HoaiMyNeural",
+                "text_hash": "b" * 64,
+                "source_url": "https://vi.wikipedia.org/",
+                "is_fallback": False,
+                "reason": None,
+            },
+        }
+        return r
+
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _cs_get_audio_ready_missing_file)
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Tai tao thanh cong
+    assert data["narration_status"] == "audio_ready"
+    assert data["cache_hit"] is False  # da tao lai, khong phai cache_hit
+    assert data["audio_url"].startswith("/audio/")
+
+
+# ---------------------------------------------------------------------------
+# Test: cache hit text_ready -> retry TTS thanh cong -> audio_ready
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_cache_hit_text_ready_retry_tts_success(tmp_path, monkeypatch):
+    """text_ready cache hit -> retry TTS thanh cong -> tra audio_ready, cache_hit=True."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateOK)
+
+    import main as _main
+
+    async def _cs_get_text_ready(self_or_url, url_or_kw=None, **kwargs):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {
+            "cache_hit": True,
+            "narration": {
+                "audio_status": "text_ready",
+                "audio_filename": None,
+                "lang": "vi",
+                "text": "Nhà thờ Đức Bà Sài Gòn là công trình kiến trúc biểu tượng.",
+                "voice": None,
+                "text_hash": "c" * 64,
+                "source_url": "https://vi.wikipedia.org/",
+                "is_fallback": False,
+                "reason": None,
+            },
+        }
+        return r
+
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _cs_get_text_ready)
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["narration_status"] == "audio_ready"
+    assert data["cache_hit"] is True
+    assert data["audio_url"].startswith("/audio/")
+    assert data["lang"] == "vi"
+
+
+# ---------------------------------------------------------------------------
+# Test: TTS loi sau text_ready -> tra 200 text_ready, audio_url=null
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_tts_fails_after_text_stored_returns_text_ready(
+    tmp_path, monkeypatch
+):
+    """Cache miss, TTS loi sau khi da luu text_ready -> tra 200, narration_status=text_ready."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr(tts, "TTS_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateTimeout)
+
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["narration_status"] == "text_ready"
+    assert data["audio_url"] is None
+    assert data["audio_filename"] is None
+    assert data["cache_hit"] is False
+    assert data["translated_text"] != ""
+    assert data["lang"] == "vi"
+
+
+# ---------------------------------------------------------------------------
+# Test: content-service timeout -> 503 cache_service_unavailable
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_content_service_timeout_returns_503(monkeypatch):
+    """content-service timeout -> tra 503 cache_service_unavailable, khong tao audio."""
+    import main as _main
+
+    async def _cs_get_timeout(self_or_url, url_or_kw=None, **kwargs):
+        raise httpx.TimeoutException("Timeout", request=None)
+
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _cs_get_timeout)
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 503
+    data = resp.json()
+    assert data["detail"]["code"] == "cache_service_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Test: PUT upsert loi -> 503 cache_upsert_failed
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_upsert_fails_returns_503(tmp_path, monkeypatch):
+    """PUT text_ready that bai -> tra 503 cache_upsert_failed, khong goi TTS."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    tts_called = [0]
+
+    class _TrackTTS:
+        def __init__(self, text, voice):
+            tts_called[0] += 1
+
+        async def save(self, fp):
+            tts_called[0] += 1
+
+    monkeypatch.setattr("edge_tts.Communicate", _TrackTTS)
+
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+
+    async def _cs_put_fail(self_or_url, url_or_kw=None, **kwargs):
+        r = MagicMock()
+        r.status_code = 500
+        r.text = "Internal Server Error"
+        return r
+
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _cs_put_fail)
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 503
+    data = resp.json()
+    assert data["detail"]["code"] == "cache_upsert_failed"
+    # TTS khong duoc goi
+    assert tts_called[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Test: content-service tra 404 (location khong ton tai)
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_location_not_found_returns_404(monkeypatch):
+    """content-service tra 404 -> tra 404 location_not_found."""
+    import main as _main
+
+    async def _cs_get_404(self_or_url, url_or_kw=None, **kwargs):
+        r = MagicMock()
+        r.status_code = 404
+        return r
+
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _cs_get_404)
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 404
+    data = resp.json()
+    assert data["detail"]["code"] == "location_not_found"
+
+
+# ---------------------------------------------------------------------------
+# Test: concurrent same key -> lock chong goi TTS trung lap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_narrate_concurrent_same_key_lock(tmp_path, monkeypatch):
+    """Hai request cung key dong thoi: lock chong TTS trung, chi goi 1 lan."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    tts_call_count = [0]
+
+    class _SlowMock:
+        def __init__(self, text, voice):
+            pass
+
+        async def save(self, filepath: str):
+            import asyncio
+            tts_call_count[0] += 1
+            await asyncio.sleep(0.05)
+            with open(filepath, "wb") as f:
+                f.write(b"ID3\x03\x00MOCK")
+
+    monkeypatch.setattr("edge_tts.Communicate", _SlowMock)
+
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    transport = httpx.ASGITransport(app=app)
+    import asyncio
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r1, r2 = await asyncio.gather(
+            ac.post("/narrate", json=NARRATE_BASE_PAYLOAD),
+            ac.post("/narrate", json=NARRATE_BASE_PAYLOAD),
+        )
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    # TTS chi duoc goi toi da 1 lan (lock chan request thu 2 cho request thu 1 xong)
+    assert tts_call_count[0] <= 1
+
+
+# ---------------------------------------------------------------------------
+# Test: audio_url la duong dan /audio/ va metadata day du
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_response_audio_url_format_and_metadata(tmp_path, monkeypatch):
+    """Kiem tra audio_url co dang /audio/..., va toan bo metadata tra ve day du."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateOK)
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    resp = client.post("/narrate", json=NARRATE_BASE_PAYLOAD)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    required_fields = [
+        "requested_lang", "lang", "translated_text", "audio_url",
+        "audio_filename", "voice", "text_hash", "source_url",
+        "is_fallback", "reason", "narration_status", "cache_hit",
+    ]
+    for field in required_fields:
+        assert field in data, f"Thieu truong: {field}"
+
+    assert data["audio_url"].startswith("/audio/")
+    assert data["audio_filename"] == data["audio_url"].removeprefix("/audio/")
+    assert len(data["text_hash"]) == 64
+    assert data["narration_status"] in ("audio_ready", "text_ready")
+
+
+# ---------------------------------------------------------------------------
+# Test: ngon ngu khong ho tro -> 422
+# ---------------------------------------------------------------------------
+
+
+def test_narrate_unsupported_language_returns_422():
+    """target_lang ngoai allowlist -> 422 Unprocessable Entity."""
+    payload = {**NARRATE_BASE_PAYLOAD, "target_lang": "ko"}
+    resp = client.post("/narrate", json=payload)
+    assert resp.status_code == 422
+
+
+def test_narrate_unsupported_source_lang_returns_422():
+    """source_lang ngoai allowlist -> 422."""
+    payload = {**NARRATE_BASE_PAYLOAD, "source_lang": "zh"}
+    resp = client.post("/narrate", json=payload)
+    assert resp.status_code == 422
+
+
+def test_narrate_missing_required_fields_returns_422():
+    """Thieu truong bat buoc -> 422."""
+    resp = client.post("/narrate", json={"location_id": 1, "target_lang": "vi"})
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Test: wikimedia_unavailable -> fallback source_text, is_fallback=True
+# ---------------------------------------------------------------------------
+
+
+@patch("wikimedia_client.get_langlink")
+def test_narrate_wikimedia_error_fallback(
+    mock_langlink, tmp_path, monkeypatch
+):
+    """Wikimedia loi khi goi vi->en: fallback source_text, reason=localization_unavailable."""
+    from wikimedia_client import WikimediaError
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+    monkeypatch.setattr("edge_tts.Communicate", _MockCommunicateOK)
+    import main as _main
+    monkeypatch.setattr(_main.httpx.AsyncClient, "get", _make_cs_get_miss())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "put", _make_cs_put_ok())
+    monkeypatch.setattr(_main.httpx.AsyncClient, "patch", _make_cs_patch_ok())
+
+    mock_langlink.side_effect = WikimediaError("upstream_error", "Wikimedia loi")
+
+    payload = {**NARRATE_BASE_PAYLOAD, "target_lang": "en"}
+    resp = client.post("/narrate", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["is_fallback"] is True
+    assert data["reason"] == "localization_unavailable"
+    assert data["lang"] == "vi"  # fallback sang nguon vi
+    assert data["requested_lang"] == "en"
+    # Khong gan nhan ngon ngu yeu cau vao text nguon
+    assert data["lang"] != "en"
