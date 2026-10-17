@@ -1,4 +1,4 @@
-# API Contract — content-service (Tuần 3 + Tuần 4)
+# API Contract — content-service (Tuần 3 + 4 + 5)
 
 Port: `8001`. Dữ liệu lưu SQLite (`content.db`), ORM SQLAlchemy.
 
@@ -83,13 +83,15 @@ Query: `latitude`, `longitude` (bắt buộc), `max_distance` (mét, mặc đị
       "distance_m": 42.3,
       "source": "wikimedia", "source_lang": "vi",
       "source_title": "...", "source_page_id": 12345,
-      "source_url": "...", "last_synced_at": "2026-10-01T10:00:00Z"
+      "source_url": "...", "last_synced_at": "2026-10-01T10:00:00Z",
+      "is_ready": false
     }
   ]
 }
 ```
-Sắp theo `distance_m` tăng dần. Chỉ trả record có GPS và `distance_m <=
-max_distance`.
+Sắp theo `distance_m` tăng dần. Trả **mọi** record có GPS và `distance_m <=
+max_distance` (không chỉ record gần nhất); record thiếu GPS bị loại. Không
+bao giờ gọi Wikimedia.
 
 ### `GET /locations/discover`
 
@@ -111,7 +113,11 @@ Query: `latitude`, `longitude` (bắt buộc), `radius` (mét, mặc định `50
 - Có candidate trong kết quả **không đồng nghĩa đã trong bán kính kích
   hoạt** — đây là bán kính khám phá rộng (mặc định 500m), gateway tự so
   với `radius` (activation, mặc định 80m) của từng candidate.
-- Khi Wikimedia lỗi: trả **503** dạng
+- Khi Wikimedia lỗi **và SQLite đã có bài Wikimedia nằm trong `radius`**: trả
+  200 dữ liệu đã lưu (giữ nguyên metadata cũ, không sửa DB):
+  `{"candidates":[...], "cache_hit": true, "stale": true, "upstream_error": "rate_limited"}`.
+  Client coi `stale=true` là "dữ liệu có thể cũ".
+- Khi Wikimedia lỗi **và không có dữ liệu đã lưu phù hợp**: trả **503** dạng
   `{"detail": {"code": "timeout"|"rate_limited"|"upstream_error", "message": "..."}}`.
   Không bao giờ trả lỗi upstream dưới dạng `candidates: []` (dễ gây hiểu
   nhầm "khu vực này không có địa điểm nào").
@@ -172,6 +178,11 @@ Upsert trong 1 transaction. Body đầy đủ (không có trường lạ, vd `au
 Trả `{"created": true|false, "narration": {...}}`. Location không có → `404`;
 vi phạm validation → `422`. Hai PUT đồng thời cùng key không tạo trùng
 (unique conflict → rollback, đọc lại, cập nhật).
+
+### `DELETE /locations/{id}/narrations/{language}`
+B dùng để loại cache hỏng/hết hạn. Location không tồn tại → `404`; `language`
+ngoài `vi|en|ja` → `422`. Key chưa có vẫn `200` (idempotent):
+`{"deleted": true|false, "id": 12, "language": "ja"}`. Tự tính lại `is_ready`.
 
 ### `PATCH /locations/{id}/mark-ready`
 Không nhận giá trị từ client. Tính lại `is_ready` từ cache:

@@ -1,400 +1,205 @@
-"""
-content-service - port 8001.
-
-File NÀY gộp chung mọi logic tuần 3 (trước đây tách ra nhiều file nhỏ:
-migrate.py, utils.py, wikimedia_client.py - gộp lại cho dễ đọc/dễ học,
-đánh đổi là file dài hơn). Đọc theo đúng 5 khu vực đánh số bên dưới,
-từ trên xuống, là hiểu được toàn bộ:
-
-  KHU VỰC 1: MIGRATION      - nâng cấp CSDL cũ (tuần 2) lên schema mới
-  KHU VỰC 2: HÀM TIỆN ÍCH   - Haversine (tính khoảng cách) + validate GPS
-  KHU VỰC 3: WIKIMEDIA      - gọi API Wikipedia để tìm bài viết gần 1 tọa độ
-  KHU VỰC 4: SCHEMA (Pydantic) - hình dạng dữ liệu JSON vào/ra API
-  KHU VỰC 5: ROUTES (FastAPI)  - các endpoint thật sự, http://.../...
-
-Tuần 4 thêm: migration v3 (bảng narration_cache) ở khu vực 1, schema
-NarrationPut ở khu vực 4, các route /locations/{id}/narrations/{language}
-và /locations/{id}/mark-ready ở cuối khu vực 5.
-
-(models.py tách riêng - đó là định nghĩa BẢNG trong CSDL, không đổi).
-"""
-
+"""content-service (port 8001). Đọc 5 khu vực từ trên xuống:
+1 MIGRATION | 2 GPS | 3 WIKIMEDIA | 4 SCHEMA (JSON vào/ra) | 5 ROUTES."""
 from __future__ import annotations
 
-import math
-import os
-import re
-import shutil
-import sqlite3
-import time
-from dataclasses import dataclass
+import math, os, re, shutil, sqlite3, time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import Base, Location, NarrationCache, SessionLocal, engine, DB_PATH
+from models import Base, DB_PATH, Location, NarrationCache, SessionLocal, engine
+
+# ============ 1. MIGRATION (create_all không tự thêm cột vào bảng cũ) ============
+NEW_COLUMNS = [("description_source", "TEXT"), ("latitude", "REAL"), ("longitude", "REAL"),
+               ("radius", "REAL"), ("source_lang", "TEXT"), ("source", "TEXT"),
+               ("source_title", "TEXT"), ("source_page_id", "INTEGER"), ("source_url", "TEXT"),
+               ("last_synced_at", "TEXT"), ("is_ready", "INTEGER")]
 
 
-# ============================================================================
-# KHU VỰC 1: MIGRATION
-# ----------------------------------------------------------------------------
-# Vì sao cần đoạn này? Base.metadata.create_all() (ở dưới cùng file) CHỈ tạo
-# bảng khi bảng đó CHƯA TỒN TẠI. Nếu máy bạn đã có sẵn content.db từ tuần 2
-# (bảng locations chỉ có 4 cột), create_all() sẽ thấy bảng đã có rồi và
-# KHÔNG tự thêm cột mới -> phải tự viết ALTER TABLE bằng tay ở đây.
-#
-# "Chạy lặp an toàn" nghĩa là: chạy hàm run_migrations() 2-3 lần liên tiếp
-# vẫn không lỗi, không ghi đè dữ liệu cũ - nhờ luôn kiểm tra "đã có chưa"
-# trước khi thêm.
-# ============================================================================
+def _has_table(conn, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
-NEW_COLUMNS = [
-    ("description_source", "TEXT"),
-    ("latitude", "REAL"),
-    ("longitude", "REAL"),
-    ("radius", "REAL"),
-    ("source_lang", "TEXT"),
-    ("source", "TEXT"),
-    ("source_title", "TEXT"),
-    ("source_page_id", "INTEGER"),
-    ("source_url", "TEXT"),
-    ("last_synced_at", "TEXT"),
-    ("is_ready", "INTEGER"),
-]
-def _migrate_v2(conn: sqlite3.Connection) -> None:
-    """Tuần 3: thêm cột GPS + metadata nguồn, backfill dữ liệu cũ, unique index."""
-    table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='locations'"
-    ).fetchone()
-    if not table_exists:
-        # DB hoàn toàn mới: create_all() ở cuối file sẽ tạo đủ cột ngay từ đầu.
+
+def _migrate_v2(conn):
+    """Tuần 3: thêm cột GPS + nguồn, backfill record cũ (không gán tọa độ 0,0), unique index."""
+    if not _has_table(conn, "locations"):
+        return  # DB mới: create_all() tạo đủ cột
+    have = {r[1] for r in conn.execute("PRAGMA table_info(locations)")}
+    for col, typ in NEW_COLUMNS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE locations ADD COLUMN {col} {typ}")
+    conn.execute("""UPDATE locations SET description_source = description_vi,
+        source_lang = COALESCE(source_lang, 'vi'), source = COALESCE(source, 'manual'),
+        radius = COALESCE(radius, 80), is_ready = COALESCE(is_ready, 0)
+        WHERE description_source IS NULL""")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_locations_source "
+                 "ON locations (source, source_lang, source_page_id)")
+
+
+def _migrate_v3(conn):
+    """Tuần 4: bảng narration_cache (FK tới locations, xóa theo cascade)."""
+    if not _has_table(conn, "locations"):
         return
-
-    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(locations)")}
-    for col_name, col_type in NEW_COLUMNS:
-        if col_name not in existing_cols:
-            conn.execute(f"ALTER TABLE locations ADD COLUMN {col_name} {col_type}")
-
-    # Backfill CHỈ cho dòng còn thiếu description_source (record từ tuần 2).
-    # Không gán tọa độ 0,0: latitude/longitude của record cũ giữ NULL.
-    conn.execute(
-        """
-        UPDATE locations
-        SET description_source = description_vi,
-            source_lang = COALESCE(source_lang, 'vi'),
-            source = COALESCE(source, 'manual'),
-            radius = COALESCE(radius, 80),
-            is_ready = COALESCE(is_ready, 0)
-        WHERE description_source IS NULL
-        """
-    )
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_locations_source "
-        "ON locations (source, source_lang, source_page_id)"
-    )
+    conn.execute("""CREATE TABLE IF NOT EXISTS narration_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        location_id INTEGER NOT NULL REFERENCES locations (id) ON DELETE CASCADE,
+        requested_lang VARCHAR NOT NULL, lang VARCHAR NOT NULL, text TEXT NOT NULL,
+        source_url VARCHAR, target_title VARCHAR, is_fallback BOOLEAN NOT NULL DEFAULT 0,
+        reason VARCHAR, voice VARCHAR, text_hash VARCHAR, audio_filename VARCHAR,
+        audio_status VARCHAR NOT NULL, created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL, expires_at DATETIME NOT NULL,
+        CONSTRAINT ux_narration_location_lang UNIQUE (location_id, requested_lang))""")
 
 
-def _migrate_v3(conn: sqlite3.Connection) -> None:
-    """Tuần 4: tạo bảng narration_cache (khóa ngoại tới locations)."""
-    table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='locations'"
-    ).fetchone()
-    if not table_exists:
-        return  # DB mới: create_all() sẽ tạo cả locations lẫn narration_cache.
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS narration_cache (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            location_id INTEGER NOT NULL
-                REFERENCES locations (id) ON DELETE CASCADE,
-            requested_lang VARCHAR NOT NULL,
-            lang VARCHAR NOT NULL,
-            text TEXT NOT NULL,
-            source_url VARCHAR,
-            target_title VARCHAR,
-            is_fallback BOOLEAN NOT NULL DEFAULT 0,
-            reason VARCHAR,
-            voice VARCHAR,
-            text_hash VARCHAR,
-            audio_filename VARCHAR,
-            audio_status VARCHAR NOT NULL,
-            created_at DATETIME NOT NULL,
-            updated_at DATETIME NOT NULL,
-            expires_at DATETIME NOT NULL,
-            CONSTRAINT ux_narration_location_lang
-                UNIQUE (location_id, requested_lang)
-        )
-        """
-    )
-
-
-# version -> hàm migration. Thêm version mới = thêm 1 dòng ở đây.
-MIGRATIONS = {2: _migrate_v2, 3: _migrate_v3}
-
-
-def _applied_versions(conn: sqlite3.Connection) -> set:
-    has_table = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
-    ).fetchone()
-    if not has_table:
-        return set()
-    return {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
+MIGRATIONS = {2: _migrate_v2, 3: _migrate_v3}  # thêm version mới = thêm 1 dòng
 
 
 def run_migrations(verbose: bool = True) -> list:
-    """
-    Chạy các migration CHƯA áp dụng, theo thứ tự version. Trả về danh sách
-    version vừa chạy. Chạy lặp lại an toàn: version đã chạy thì bỏ qua.
-    """
-    # Bước 1: xem còn migration nào chờ không. Không có thì thoát luôn
-    # (không sao lưu, không đụng DB).
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        pending = [v for v in sorted(MIGRATIONS) if v not in _applied_versions(conn)]
-    finally:
-        conn.close()
-    if not pending:
-        if verbose:
-            print("[migrate] Schema đã cập nhật, không có gì để làm.")
-        return []
-
-    # Bước 2: sao lưu file DB (nếu đã có dữ liệu) TRƯỚC khi đổi schema.
-    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        backup_path = f"{DB_PATH}.bak-{ts}"
-        shutil.copy2(DB_PATH, backup_path)
-        if verbose:
-            print(f"[migrate] Đã sao lưu DB -> {backup_path}")
-
-    # Bước 3: mỗi version chạy trong 1 transaction riêng (SQLite cho phép
-    # DDL nằm trong transaction) -> lỗi giữa chừng thì rollback sạch.
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)  # tự quản lý BEGIN/COMMIT
-    applied_now = []
+    """Chạy các version chưa áp dụng (mỗi version 1 transaction). Chạy lặp an toàn."""
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
     try:
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations "
-            "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-        )
-        for version in pending:
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
+                     "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        done = {r[0] for r in conn.execute("SELECT version FROM schema_migrations")}
+        pending = [v for v in sorted(MIGRATIONS) if v not in done]
+        if not pending:
+            return []
+        if os.path.getsize(DB_PATH) > 0:  # sao lưu CHỈ khi có version chờ
+            backup = f"{DB_PATH}.bak-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+            shutil.copy2(DB_PATH, backup)
+            verbose and print(f"[migrate] Đã sao lưu DB -> {backup}")
+        for v in pending:
             conn.execute("BEGIN")
             try:
-                MIGRATIONS[version](conn)
-                conn.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                    (version, datetime.now(timezone.utc).isoformat()),
-                )
+                MIGRATIONS[v](conn)
+                conn.execute("INSERT INTO schema_migrations VALUES (?, ?)",
+                             (v, datetime.now(timezone.utc).isoformat()))
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-            applied_now.append(version)
-            if verbose:
-                print(f"[migrate] Đã áp dụng version {version}.")
+            verbose and print(f"[migrate] Đã áp dụng version {v}.")
+        return pending
     finally:
         conn.close()
-    return applied_now
 
 
-# ============================================================================
-# KHU VỰC 2: HÀM TIỆN ÍCH - khoảng cách GPS
-# ============================================================================
+# ============ 2. GPS ============
+def haversine_m(lat1, lon1, lat2, lon2) -> float:
+    """Khoảng cách 2 điểm GPS, đơn vị MÉT."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin((p2 - p1) / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return 2 * 6_371_000.0 * math.asin(math.sqrt(a))
 
 
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Khoảng cách giữa 2 điểm GPS, đơn vị MÉT (coi Trái Đất là hình cầu)."""
-    R = 6_371_000.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = (
-        math.sin(d_phi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    )
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def validate_coords(latitude: Optional[float], longitude: Optional[float]) -> None:
-    """Raise ValueError nếu tọa độ không hữu hạn hoặc ngoài khoảng hợp lệ."""
-    if latitude is None or longitude is None:
+def validate_coords(lat: Optional[float], lon: Optional[float]) -> None:
+    if lat is None or lon is None:
         return
-    if not (math.isfinite(latitude) and math.isfinite(longitude)):
+    if not (math.isfinite(lat) and math.isfinite(lon)):
         raise ValueError("Tọa độ phải là số hữu hạn")
-    if not (-90 <= latitude <= 90):
-        raise ValueError("latitude phải nằm trong khoảng [-90, 90]")
-    if not (-180 <= longitude <= 180):
-        raise ValueError("longitude phải nằm trong khoảng [-180, 180]")
+    if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        raise ValueError("latitude phải trong [-90,90], longitude trong [-180,180]")
 
 
-# ============================================================================
-# KHU VỰC 3: WIKIMEDIA CLIENT - gọi API Wikipedia tiếng Việt
-# ============================================================================
-
+# ============ 3. WIKIMEDIA (cache RAM 60s theo ô ~100m) ============
 WIKI_API_URL = "https://vi.wikipedia.org/w/api.php"
 WIKI_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
-WIKI_MAX_RETRY = 1
 WIKI_CACHE_TTL_SECONDS = 60
-WIKI_GRID_DECIMALS = 3  # làm tròn tọa độ ~100m để gộp cache
-
-_wiki_cache: dict[tuple, tuple[list[dict], float]] = {}
+_wiki_cache: dict = {}
 
 
 class WikimediaError(Exception):
     """code: 'timeout' | 'rate_limited' | 'upstream_error'."""
 
     def __init__(self, code: str, message: str):
-        self.code = code
-        self.message = message
+        self.code, self.message = code, message
         super().__init__(message)
 
 
-def _wiki_user_agent() -> str:
-    ua = os.environ.get("WIKIMEDIA_USER_AGENT")
-    if ua:
-        return ua
-    print("[wikimedia] CẢNH BÁO: thiếu WIKIMEDIA_USER_AGENT trong .env.")
-    return "content-service-do-an-cnpm/1.0"
-
-
 def _wiki_request(client: httpx.Client, params: dict) -> dict:
-    """Gọi 1 request tới Wikimedia, tự retry tối đa 1 lần nếu 429/5xx."""
-    attempts = 0
-    while True:
-        attempts += 1
+    """1 request tới Wikimedia, retry tối đa 1 lần khi 429/5xx (tôn trọng Retry-After)."""
+    ua = os.environ.get("WIKIMEDIA_USER_AGENT") or "content-service-do-an-cnpm/1.0"
+    for attempt in (1, 2):
         try:
-            resp = client.get(
-                WIKI_API_URL, params=params, headers={"User-Agent": _wiki_user_agent()}
-            )
+            resp = client.get(WIKI_API_URL, params=params, headers={"User-Agent": ua})
         except httpx.TimeoutException as exc:
             raise WikimediaError("timeout", "Wikimedia không phản hồi kịp") from exc
         except httpx.RequestError as exc:
             raise WikimediaError("upstream_error", f"Lỗi kết nối: {exc}") from exc
-
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            wait_s = min(float(retry_after) if retry_after and retry_after.isdigit() else 1.0, 3.0)
-            if attempts <= WIKI_MAX_RETRY:
-                time.sleep(wait_s)
-                continue
-            raise WikimediaError("rate_limited", "Wikimedia trả 429 quá số lần retry")
-
-        if resp.status_code >= 500 and attempts <= WIKI_MAX_RETRY:
-            time.sleep(0.5)
+        if (resp.status_code == 429 or resp.status_code >= 500) and attempt == 1:
+            wait = resp.headers.get("Retry-After", "")
+            time.sleep(min(float(wait), 3.0) if wait.isdigit() else 1.0)
             continue
-        if resp.status_code >= 400:
-            raise WikimediaError("upstream_error", f"HTTP {resp.status_code}")
+        break
+    if resp.status_code == 429:
+        raise WikimediaError("rate_limited", "Wikimedia trả 429 quá số lần retry")
+    if resp.status_code >= 400:
+        raise WikimediaError("upstream_error", f"HTTP {resp.status_code}")
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise WikimediaError("upstream_error", "Phản hồi không phải JSON") from exc
 
-        try:
-            return resp.json()
-        except ValueError as exc:
-            raise WikimediaError("upstream_error", "Phản hồi không phải JSON") from exc
 
-
-def wikimedia_discover(lat: float, lon: float, radius: float, limit: int) -> tuple[list[dict], bool]:
-    """
-    Trả (candidates, cache_hit).
-    1. geosearch: tìm pageid các bài gần tọa độ.
-    2. extracts: lấy đoạn giới thiệu + url của các pageid đó.
-    Bỏ bài thiếu tọa độ hoặc thiếu đoạn giới thiệu. GPS lấy từ chính bài
-    viết (geosearch trả về), KHÔNG dùng GPS người dùng truyền vào.
-    """
-    key = (round(lat, WIKI_GRID_DECIMALS), round(lon, WIKI_GRID_DECIMALS), radius, limit)
-    now = time.monotonic()
+def wikimedia_discover(lat: float, lon: float, radius: float, limit: int):
+    """Trả (candidates, cache_hit). Bỏ bài thiếu tọa độ/giới thiệu; GPS lấy từ bài, không từ người dùng."""
+    key = (round(lat, 3), round(lon, 3), radius, limit)
     cached = _wiki_cache.get(key)
-    if cached and cached[1] > now:
+    if cached and cached[1] > time.monotonic():
         return cached[0], True
 
     with httpx.Client(timeout=WIKI_TIMEOUT) as client:
-        geo_data = _wiki_request(
-            client,
-            {
-                "action": "query", "list": "geosearch",
-                "gscoord": f"{lat}|{lon}", "gsradius": int(radius),
-                "gsnamespace": 0, "gslimit": limit, "format": "json",
-            },
-        )
-        geo_results = geo_data.get("query", {}).get("geosearch", [])
-        pageids = [item["pageid"] for item in geo_results if "pageid" in item]
-
+        geo = _wiki_request(client, {
+            "action": "query", "list": "geosearch", "gscoord": f"{lat}|{lon}",
+            "gsradius": int(radius), "gsnamespace": 0, "gslimit": limit, "format": "json"})
+        geo_by_id = {g["pageid"]: g for g in geo.get("query", {}).get("geosearch", []) if "pageid" in g}
         pages = {}
-        if pageids:
-            ext_data = _wiki_request(
-                client,
-                {
-                    "action": "query", "prop": "extracts|info",
-                    "exintro": 1, "explaintext": 1, "inprop": "url",
-                    "pageids": "|".join(str(p) for p in pageids), "format": "json",
-                },
-            )
-            pages = ext_data.get("query", {}).get("pages", {})
+        if geo_by_id:
+            ext = _wiki_request(client, {
+                "action": "query", "prop": "extracts|info", "exintro": 1, "explaintext": 1,
+                "inprop": "url", "pageids": "|".join(map(str, geo_by_id)), "format": "json"})
+            pages = ext.get("query", {}).get("pages", {})
 
-    geo_by_pageid = {item["pageid"]: item for item in geo_results}
     synced_at = datetime.now(timezone.utc)
-
-    candidates = []
-    for page in pages.values():
-        pageid = page.get("pageid")
-        extract = page.get("extract")
-        geo = geo_by_pageid.get(pageid)
-        if not geo or not extract:  # thiếu tọa độ hoặc thiếu giới thiệu -> bỏ
-            continue
-        candidates.append({
-            "source_page_id": pageid,
-            "source_title": page.get("title"),
-            "description_source": extract,
-            "source_url": page.get("fullurl") or page.get("canonicalurl"),
-            "latitude": geo.get("lat"),
-            "longitude": geo.get("lon"),
-            "last_synced_at": synced_at,
-        })
-
-    _wiki_cache[key] = (candidates, now + WIKI_CACHE_TTL_SECONDS)  # cache cả khi rỗng
+    candidates = [{
+        "source_page_id": p["pageid"], "source_title": p.get("title"),
+        "description_source": p["extract"], "source_url": p.get("fullurl") or p.get("canonicalurl"),
+        "latitude": geo_by_id[p["pageid"]].get("lat"), "longitude": geo_by_id[p["pageid"]].get("lon"),
+        "last_synced_at": synced_at,
+    } for p in pages.values() if p.get("extract") and p.get("pageid") in geo_by_id]
+    _wiki_cache[key] = (candidates, time.monotonic() + WIKI_CACHE_TTL_SECONDS)  # cache cả khi rỗng
     return candidates, False
 
 
-# ============================================================================
-# KHU VỰC 4: PYDANTIC SCHEMA - hình dạng JSON vào/ra API
-# (khác với Location trong models.py - đó là BẢNG thật trong CSDL)
-# ============================================================================
-
-
+# ============ 4. SCHEMA (Pydantic: JSON vào/ra) ============
 class LocationCreate(BaseModel):
     name: str
     description_vi: str
     target_languages: str
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    radius: Optional[float] = 80
+    radius: Optional[float] = Field(80, gt=0)
 
     @field_validator("name", "description_vi", "target_languages")
     @classmethod
     def _not_blank(cls, v: str) -> str:
-        if not v or not v.strip():
+        if not v.strip():
             raise ValueError("Không được để trống")
         return v
 
-    @field_validator("radius")
-    @classmethod
-    def _radius_positive(cls, v):
-        if v is not None and v <= 0:
-            raise ValueError("radius phải > 0")
-        return v
-
-    @field_validator("longitude")
-    @classmethod
-    def _coords_valid(cls, v, info):
-        lat = info.data.get("latitude")
-        if lat is not None or v is not None:
-            validate_coords(lat, v)
-        return v
+    @model_validator(mode="after")
+    def _coords(self):
+        validate_coords(self.latitude, self.longitude)
+        return self
 
 
 class LocationResponse(BaseModel):
@@ -413,27 +218,11 @@ class LocationResponse(BaseModel):
     source_url: Optional[str] = None
     last_synced_at: Optional[datetime] = None
     is_ready: Optional[bool] = None
-
     model_config = ConfigDict(from_attributes=True)
 
 
-class NearbyCandidate(BaseModel):
-    id: int
-    name: str
-    description_source: Optional[str] = None
-    latitude: float
-    longitude: float
-    radius: Optional[float] = None
-    distance_m: float
-    source: Optional[str] = None
-    source_lang: Optional[str] = None
-    source_title: Optional[str] = None
-    source_page_id: Optional[int] = None
-    source_url: Optional[str] = None
-    last_synced_at: Optional[datetime] = None
-
-
 class DiscoverCandidate(BaseModel):
+    """Location rút gọn cho /discover; /nearby thêm distance_m."""
     id: int
     name: str
     description_source: Optional[str] = None
@@ -446,23 +235,24 @@ class DiscoverCandidate(BaseModel):
     source_page_id: Optional[int] = None
     source_url: Optional[str] = None
     last_synced_at: Optional[datetime] = None
+    is_ready: Optional[bool] = None
+    model_config = ConfigDict(from_attributes=True)
 
 
-# ---------------------------- Tuần 4: narration cache ----------------------------
+class NearbyCandidate(DiscoverCandidate):
+    distance_m: float
+
 
 VALID_LANGS = {"vi", "en", "ja"}
-AUDIO_STATUSES = {"text_ready", "audio_ready"}
-# Chỉ nhận TÊN FILE mp3 thuần: bắt đầu bằng chữ/số, không có '/', '\\', ':'.
 AUDIO_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp3$", re.IGNORECASE)
 
 
 def utcnow() -> datetime:
-    """Giờ UTC, không kèm tzinfo (SQLite lưu datetime dạng text không múi giờ)."""
+    """Giờ UTC không tzinfo (SQLite lưu datetime không múi giờ)."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def narration_ttl() -> timedelta:
-    """TTL cache narration, cấu hình bằng NARRATION_TTL_DAYS (mặc định 7 ngày)."""
     try:
         days = float(os.environ.get("NARRATION_TTL_DAYS", "7"))
     except ValueError:
@@ -471,13 +261,10 @@ def narration_ttl() -> timedelta:
 
 
 class NarrationPut(BaseModel):
-    """Body của PUT /locations/{id}/narrations/{language} (bản ghi đầy đủ)."""
-
-    # extra="forbid": body có trường lạ (vd audio_url) -> 422. DB chỉ lưu
-    # audio_filename, không lưu URL có hostname của container.
+    """Body PUT narration. extra=forbid: trường lạ (vd audio_url) -> 422."""
     model_config = ConfigDict(extra="forbid")
 
-    requested_lang: Optional[str] = None  # nếu gửi thì phải khớp {language} trên path
+    requested_lang: Optional[str] = None  # nếu gửi phải khớp {language} trên path
     lang: str
     text: str
     source_url: Optional[str] = None
@@ -490,127 +277,69 @@ class NarrationPut(BaseModel):
     audio_status: str
     expires_at: Optional[datetime] = None
 
-    @field_validator("requested_lang", "lang")
-    @classmethod
-    def _lang_allowed(cls, v):
-        if v is not None and v not in VALID_LANGS:
-            raise ValueError(f"Ngôn ngữ phải thuộc {sorted(VALID_LANGS)}")
-        return v
-
-    @field_validator("text")
-    @classmethod
-    def _text_valid(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("text không được để trống")
-        if len(v) > 10000:
-            raise ValueError("text quá dài (tối đa 10000 ký tự)")
-        return v
-
-    @field_validator("audio_status")
-    @classmethod
-    def _status_valid(cls, v: str) -> str:
-        if v not in AUDIO_STATUSES:
-            raise ValueError(f"audio_status phải thuộc {sorted(AUDIO_STATUSES)}")
-        return v
-
-    @field_validator("audio_filename")
-    @classmethod
-    def _filename_valid(cls, v):
-        if v is None:
-            return v
-        if ".." in v or not AUDIO_FILENAME_RE.match(v):
-            raise ValueError("audio_filename phải là tên file .mp3 thuần (không chứa đường dẫn)")
-        return v
-
-    @field_validator("source_url")
-    @classmethod
-    def _url_valid(cls, v):
-        if v is not None and not re.match(r"^https?://\S+$", v):
-            raise ValueError("source_url phải là URL http/https")
-        return v
-
-    @field_validator("target_title", "reason", "voice", "text_hash")
-    @classmethod
-    def _not_blank_if_given(cls, v):
-        if v is not None and not v.strip():
-            raise ValueError("Không được là chuỗi rỗng (hãy dùng null)")
-        return v
-
     @model_validator(mode="after")
-    def _cross_checks(self):
+    def _check(self):
+        for lang in (self.requested_lang, self.lang):
+            if lang is not None and lang not in VALID_LANGS:
+                raise ValueError(f"Ngôn ngữ phải thuộc {sorted(VALID_LANGS)}")
+        if not self.text.strip() or len(self.text) > 10000:
+            raise ValueError("text không được rỗng và tối đa 10000 ký tự")
+        if self.audio_status not in ("text_ready", "audio_ready"):
+            raise ValueError("audio_status phải là text_ready hoặc audio_ready")
+        fn = self.audio_filename
+        if fn is not None and (".." in fn or not AUDIO_FILENAME_RE.match(fn)):
+            raise ValueError("audio_filename phải là tên file .mp3 thuần (không chứa đường dẫn)")
+        if self.source_url is not None and not re.match(r"^https?://\S+$", self.source_url):
+            raise ValueError("source_url phải là URL http/https")
+        for v in (self.target_title, self.reason, self.voice, self.text_hash):
+            if v is not None and not v.strip():
+                raise ValueError("Không được là chuỗi rỗng (hãy dùng null)")
         if self.voice and not self.voice.startswith(self.lang + "-"):
             raise ValueError(f"voice '{self.voice}' không khớp lang '{self.lang}'")
-        if self.is_fallback and not self.reason:
-            raise ValueError("is_fallback=true thì phải có reason")
-        if not self.is_fallback and self.reason:
-            raise ValueError("is_fallback=false thì reason phải là null")
+        if self.is_fallback != bool(self.reason):
+            raise ValueError("is_fallback=true thì phải có reason, false thì reason=null")
         if self.audio_status == "audio_ready":
-            if not (self.audio_filename and self.voice and self.text_hash):
+            if not (fn and self.voice and self.text_hash):
                 raise ValueError("audio_ready cần đủ audio_filename, voice, text_hash")
-        elif self.audio_filename is not None:
+        elif fn is not None:
             raise ValueError("text_ready không được có audio_filename")
         return self
 
 
 def narration_to_dict(n: NarrationCache) -> dict:
-    return {
-        "location_id": n.location_id,
-        "requested_lang": n.requested_lang,
-        "lang": n.lang,
-        "text": n.text,
-        "source_url": n.source_url,
-        "target_title": n.target_title,
-        "is_fallback": bool(n.is_fallback),
-        "reason": n.reason,
-        "voice": n.voice,
-        "text_hash": n.text_hash,
-        "audio_filename": n.audio_filename,
-        "audio_status": n.audio_status,
-        "created_at": n.created_at,
-        "updated_at": n.updated_at,
-        "expires_at": n.expires_at,
-    }
+    return {c.name: getattr(n, c.name) for c in NarrationCache.__table__.columns if c.name != "id"}
 
 
 def _find_narration(db: Session, location_id: int, requested_lang: str):
-    return db.execute(
-        select(NarrationCache).where(
-            NarrationCache.location_id == location_id,
-            NarrationCache.requested_lang == requested_lang,
-        )
-    ).scalar_one_or_none()
+    return db.execute(select(NarrationCache).where(
+        NarrationCache.location_id == location_id,
+        NarrationCache.requested_lang == requested_lang)).scalar_one_or_none()
+
+
+def _ready_languages(db: Session, location_id: int) -> list:
+    """Các ngôn ngữ audio_ready còn hạn."""
+    db.flush()  # session autoflush=False -> flush tay để đọc đúng
+    return list(db.execute(select(NarrationCache.requested_lang).where(
+        NarrationCache.location_id == location_id,
+        NarrationCache.audio_status == "audio_ready",
+        NarrationCache.expires_at > utcnow()).order_by(NarrationCache.requested_lang)).scalars())
 
 
 def _recompute_is_ready(db: Session, location: Location) -> bool:
     """is_ready = có ÍT NHẤT 1 narration audio_ready còn hạn (bất kỳ ngôn ngữ nào)."""
-    db.flush()  # SessionLocal đang autoflush=False -> flush tay để đếm đúng
-    count = db.execute(
-        select(func.count())
-        .select_from(NarrationCache)
-        .where(
-            NarrationCache.location_id == location.id,
-            NarrationCache.audio_status == "audio_ready",
-            NarrationCache.expires_at > utcnow(),
-        )
-    ).scalar_one()
-    location.is_ready = count > 0
+    location.is_ready = bool(_ready_languages(db, location.id))
     return location.is_ready
 
 
 def _invalidate_narrations(db: Session, location: Location) -> None:
-    """Xóa toàn bộ cache narration của địa điểm và đặt lại is_ready=False."""
     db.execute(delete(NarrationCache).where(NarrationCache.location_id == location.id))
     location.is_ready = False
 
 
-# ============================================================================
-# KHU VỰC 5: FASTAPI APP + ROUTES
-# ============================================================================
-
+# ============ 5. FASTAPI APP + ROUTES ============
 app = FastAPI(title="content-service")
-
-run_migrations()  # (1) xử lý DB cũ từ tuần 2
-Base.metadata.create_all(bind=engine)  # (2) xử lý DB hoàn toàn mới
+run_migrations()                       # DB cũ (tuần 2)
+Base.metadata.create_all(bind=engine)  # DB mới hoàn toàn
 
 
 def get_db():
@@ -619,219 +348,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-
-@app.get("/health")
-def health_check():
-    return {"service": "content-service", "status": "ok"}
-
-
-# --- 2 route TĨNH dưới đây phải nằm TRƯỚC route động /locations/{location_id},
-# nếu không FastAPI sẽ khớp nhầm "nearby"/"discover" vào location_id ---
-
-
-@app.get("/locations/nearby")
-def locations_nearby(
-    latitude: float = Query(...),
-    longitude: float = Query(...),
-    max_distance: float = Query(500, gt=0),
-    db: Session = Depends(get_db),
-):
-    """Tìm trong dữ liệu ĐÃ LƯU SẴN (không gọi Wikimedia)."""
-    try:
-        validate_coords(latitude, longitude)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-    rows = db.execute(
-        select(Location).where(Location.latitude.isnot(None), Location.longitude.isnot(None))
-    ).scalars().all()
-
-    candidates = []
-    for loc in rows:
-        d = haversine_m(latitude, longitude, loc.latitude, loc.longitude)
-        if d <= max_distance:
-            candidates.append(NearbyCandidate(
-                id=loc.id, name=loc.name, description_source=loc.description_source,
-                latitude=loc.latitude, longitude=loc.longitude, radius=loc.radius,
-                distance_m=d, source=loc.source, source_lang=loc.source_lang,
-                source_title=loc.source_title, source_page_id=loc.source_page_id,
-                source_url=loc.source_url, last_synced_at=loc.last_synced_at,
-            ))
-    candidates.sort(key=lambda c: c.distance_m)
-    return {"candidates": [c.model_dump() for c in candidates]}
-
-
-@app.get("/locations/discover")
-def locations_discover(
-    latitude: float = Query(...),
-    longitude: float = Query(...),
-    radius: float = Query(500, gt=0),
-    limit: int = Query(5, gt=0, le=50),
-    db: Session = Depends(get_db),
-):
-    """Tìm bài Wikipedia quanh tọa độ, UPSERT vào CSDL."""
-    try:
-        validate_coords(latitude, longitude)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-    try:
-        raw_candidates, cache_hit = wikimedia_discover(latitude, longitude, radius, limit)
-    except WikimediaError as exc:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": {"code": exc.code, "message": exc.message}},
-        )
-
-    result = []
-    for item in raw_candidates:
-        loc = _upsert_wikimedia_location(db, item, fetched_now=not cache_hit)
-        result.append(DiscoverCandidate(
-            id=loc.id, name=loc.name, description_source=loc.description_source,
-            latitude=loc.latitude, longitude=loc.longitude, radius=loc.radius,
-            source=loc.source, source_lang=loc.source_lang, source_title=loc.source_title,
-            source_page_id=loc.source_page_id, source_url=loc.source_url,
-            last_synced_at=loc.last_synced_at,
-        ).model_dump())
-
-    return {"candidates": result, "cache_hit": cache_hit}
-
-
-def _find_wikimedia(db: Session, source_page_id: int, source_lang: str = "vi"):
-    return db.execute(
-        select(Location).where(
-            Location.source == "wikimedia",
-            Location.source_lang == source_lang,
-            Location.source_page_id == source_page_id,
-        )
-    ).scalar_one_or_none()
-
-
-def _upsert_wikimedia_location(db: Session, item: dict, fetched_now: bool = True) -> Location:
-    """
-    Thêm mới hoặc cập nhật 1 record nguồn Wikimedia (chống trùng theo pageid).
-
-    fetched_now=True : dữ liệu VỪA lấy thật từ Wikimedia -> được refresh
-                       last_synced_at (và nội dung/tọa độ nếu đổi).
-    fetched_now=False: dữ liệu chỉ lấy từ cache 60s -> record đã có thì giữ
-                       nguyên, KHÔNG ghi đè last_synced_at (không giả tạo
-                       thời gian đồng bộ khi chỉ đọc cache).
-    """
-    source_lang = "vi"
-    existing = _find_wikimedia(db, item["source_page_id"], source_lang)
-
-    if existing:
-        if not fetched_now:
-            return existing
-        content_changed = (
-            existing.description_source != item["description_source"]
-            or existing.latitude != item["latitude"]
-            or existing.longitude != item["longitude"]
-        )
-        existing.name = item["source_title"]
-        existing.description_source = item["description_source"]
-        existing.source_title = item["source_title"]
-        existing.source_url = item["source_url"]
-        existing.latitude = item["latitude"]
-        existing.longitude = item["longitude"]
-        existing.last_synced_at = item["last_synced_at"]
-        if existing.radius is None:
-            existing.radius = 80
-        if content_changed:
-            # Nội dung/tọa độ nguồn đổi -> narration đã cache không còn đúng.
-            _invalidate_narrations(db, existing)
-        db.commit()
-        db.refresh(existing)
-        return existing
-
-    new_loc = Location(
-        name=item["source_title"], description_vi=item["description_source"],
-        target_languages="", description_source=item["description_source"],
-        latitude=item["latitude"], longitude=item["longitude"], radius=80,
-        source_lang=source_lang, source="wikimedia", source_title=item["source_title"],
-        source_page_id=item["source_page_id"], source_url=item["source_url"],
-        last_synced_at=item["last_synced_at"], is_ready=False,
-    )
-    db.add(new_loc)
-    try:
-        db.commit()
-    except IntegrityError:
-        # 2 discovery đồng thời cùng insert 1 pageid: request thua cuộc bị
-        # unique(source, source_lang, source_page_id) từ chối -> rollback
-        # (để session dùng lại được), rồi đọc lại record của request thắng.
-        db.rollback()
-        return _find_wikimedia(db, item["source_page_id"], source_lang)
-    db.refresh(new_loc)
-    return new_loc
-
-
-# --- CRUD cũ (tuần 2) + DELETE mới (tuần 3) ---
-
-
-@app.post("/locations", response_model=LocationResponse)
-def create_location(location: LocationCreate, db: Session = Depends(get_db)):
-    new_location = Location(
-        name=location.name, description_vi=location.description_vi,
-        target_languages=location.target_languages, description_source=location.description_vi,
-        latitude=location.latitude, longitude=location.longitude,
-        radius=location.radius if location.latitude is not None else None,
-        source_lang="vi", source="manual", is_ready=False,
-    )
-    db.add(new_location)
-    db.commit()
-    db.refresh(new_location)
-    return new_location
-
-
-@app.get("/locations", response_model=List[LocationResponse])
-def get_locations(db: Session = Depends(get_db)):
-    return db.execute(select(Location)).scalars().all()
-
-
-@app.get("/locations/{location_id}", response_model=LocationResponse)
-def get_location(location_id: int, db: Session = Depends(get_db)):
-    location = db.get(Location, location_id)
-    if location is None:
-        raise HTTPException(status_code=404, detail="Không tìm thấy địa điểm")
-    return location
-
-
-@app.put("/locations/{location_id}", response_model=LocationResponse)
-def update_location(location_id: int, updated: LocationCreate, db: Session = Depends(get_db)):
-    location = db.get(Location, location_id)
-    if location is None:
-        raise HTTPException(status_code=404, detail="Không tìm thấy địa điểm")
-    old_content = (location.description_source, location.latitude, location.longitude)
-    location.name = updated.name
-    location.description_vi = updated.description_vi
-    location.target_languages = updated.target_languages
-    location.description_source = updated.description_vi
-    location.latitude = updated.latitude
-    location.longitude = updated.longitude
-    location.radius = updated.radius if updated.latitude is not None else None
-    if old_content != (location.description_source, location.latitude, location.longitude):
-        # Nội dung hoặc tọa độ nguồn đổi -> cache narration cũ không còn đúng.
-        # (Chỉ đổi name/target_languages/radius thì giữ nguyên cache.)
-        _invalidate_narrations(db, location)
-    db.commit()
-    db.refresh(location)
-    return location
-
-
-@app.delete("/locations/{location_id}")
-def delete_location(location_id: int, db: Session = Depends(get_db)):
-    location = db.get(Location, location_id)
-    if location is None:
-        raise HTTPException(status_code=404, detail="Không tìm thấy địa điểm")
-    # Xóa cache narration trước (không để dòng mồ côi trỏ tới location đã xóa).
-    db.execute(delete(NarrationCache).where(NarrationCache.location_id == location_id))
-    db.delete(location)
-    db.commit()
-    return {"deleted": True, "id": location_id}
-
-
-# --- Tuần 4: kho cache narration + trạng thái sẵn sàng ---
 
 
 def _get_location_or_404(db: Session, location_id: int) -> Location:
@@ -843,36 +359,180 @@ def _get_location_or_404(db: Session, location_id: int) -> Location:
 
 def _check_language(language: str) -> None:
     if language not in VALID_LANGS:
-        raise HTTPException(
-            status_code=422, detail=f"language phải thuộc {sorted(VALID_LANGS)}"
-        )
+        raise HTTPException(status_code=422, detail=f"language phải thuộc {sorted(VALID_LANGS)}")
 
 
+def _check_gps(latitude: float, longitude: float) -> None:
+    try:
+        validate_coords(latitude, longitude)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.get("/health")
+def health_check():
+    return {"service": "content-service", "status": "ok"}
+
+
+# 2 route TĨNH phải đứng TRƯỚC /locations/{location_id}, nếu không "nearby" bị bắt làm id.
+@app.get("/locations/nearby")
+def locations_nearby(latitude: float = Query(...), longitude: float = Query(...),
+                     max_distance: float = Query(500, gt=0), db: Session = Depends(get_db)):
+    """Tìm trong dữ liệu ĐÃ LƯU (không gọi Wikimedia); mọi điểm có GPS trong max_distance."""
+    _check_gps(latitude, longitude)
+    rows = db.execute(select(Location).where(
+        Location.latitude.isnot(None), Location.longitude.isnot(None))).scalars()
+    found = []
+    for loc in rows:
+        d = haversine_m(latitude, longitude, loc.latitude, loc.longitude)
+        if d <= max_distance:
+            base = DiscoverCandidate.model_validate(loc).model_dump()
+            found.append(NearbyCandidate(**base, distance_m=d))
+    found.sort(key=lambda c: c.distance_m)
+    return {"candidates": [c.model_dump() for c in found]}
+
+
+def _stored_wikimedia_near(db: Session, lat: float, lon: float, radius: float, limit: int):
+    """Bài Wikimedia ĐÃ LƯU trong SQLite nằm trong radius, gần nhất trước."""
+    rows = db.execute(select(Location).where(
+        Location.source == "wikimedia", Location.latitude.isnot(None),
+        Location.longitude.isnot(None))).scalars()
+    pairs = [(haversine_m(lat, lon, r.latitude, r.longitude), r) for r in rows]
+    return [r for d, r in sorted((p for p in pairs if p[0] <= radius), key=lambda p: p[0])[:limit]]
+
+
+@app.get("/locations/discover")
+def locations_discover(latitude: float = Query(...), longitude: float = Query(...),
+                       radius: float = Query(500, gt=0), limit: int = Query(5, gt=0, le=50),
+                       db: Session = Depends(get_db)):
+    """Tìm bài Wikipedia quanh tọa độ rồi UPSERT vào CSDL."""
+    _check_gps(latitude, longitude)
+    try:
+        raw, cache_hit = wikimedia_discover(latitude, longitude, radius, limit)
+    except WikimediaError as exc:
+        # Upstream lỗi: có dữ liệu đã lưu -> phục vụ (stale, không sửa DB); không có -> 503.
+        stored = _stored_wikimedia_near(db, latitude, longitude, radius, limit)
+        if stored:
+            return {"candidates": [DiscoverCandidate.model_validate(x).model_dump() for x in stored],
+                    "cache_hit": True, "stale": True, "upstream_error": exc.code}
+        return JSONResponse(status_code=503,
+                            content={"detail": {"code": exc.code, "message": exc.message}})
+    result = [DiscoverCandidate.model_validate(_upsert_wikimedia_location(db, item, not cache_hit)).model_dump()
+              for item in raw]
+    return {"candidates": result, "cache_hit": cache_hit}
+
+
+def _find_wikimedia(db: Session, source_page_id: int, source_lang: str = "vi"):
+    return db.execute(select(Location).where(
+        Location.source == "wikimedia", Location.source_lang == source_lang,
+        Location.source_page_id == source_page_id)).scalar_one_or_none()
+
+
+def _upsert_wikimedia_location(db: Session, item: dict, fetched_now: bool = True) -> Location:
+    """Thêm/cập nhật 1 bài Wikimedia (chống trùng theo pageid).
+    fetched_now=False (chỉ đọc cache 60s): record có sẵn giữ nguyên, không đổi last_synced_at."""
+    existing = _find_wikimedia(db, item["source_page_id"])
+    if existing:
+        if not fetched_now:
+            return existing
+        changed = (existing.description_source, existing.latitude, existing.longitude) != (
+            item["description_source"], item["latitude"], item["longitude"])
+        existing.name = existing.source_title = item["source_title"]
+        existing.description_source = item["description_source"]
+        existing.source_url = item["source_url"]
+        existing.latitude, existing.longitude = item["latitude"], item["longitude"]
+        existing.last_synced_at = item["last_synced_at"]
+        existing.radius = existing.radius or 80
+        if changed:  # nội dung/tọa độ đổi -> narration đã cache không còn đúng
+            _invalidate_narrations(db, existing)
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    new_loc = Location(
+        name=item["source_title"], description_vi=item["description_source"], target_languages="",
+        description_source=item["description_source"], latitude=item["latitude"],
+        longitude=item["longitude"], radius=80, source_lang="vi", source="wikimedia",
+        source_title=item["source_title"], source_page_id=item["source_page_id"],
+        source_url=item["source_url"], last_synced_at=item["last_synced_at"], is_ready=False)
+    db.add(new_loc)
+    try:
+        db.commit()
+    except IntegrityError:  # 2 discovery đồng thời cùng pageid: rollback rồi đọc lại bản của request thắng
+        db.rollback()
+        return _find_wikimedia(db, item["source_page_id"])
+    db.refresh(new_loc)
+    return new_loc
+
+
+# --- CRUD ---
+@app.post("/locations", response_model=LocationResponse)
+def create_location(body: LocationCreate, db: Session = Depends(get_db)):
+    loc = Location(
+        name=body.name, description_vi=body.description_vi, target_languages=body.target_languages,
+        description_source=body.description_vi, latitude=body.latitude, longitude=body.longitude,
+        radius=body.radius if body.latitude is not None else None,
+        source_lang="vi", source="manual", is_ready=False)
+    db.add(loc)
+    db.commit()
+    db.refresh(loc)
+    return loc
+
+
+@app.get("/locations", response_model=List[LocationResponse])
+def get_locations(db: Session = Depends(get_db)):
+    return db.execute(select(Location)).scalars().all()
+
+
+@app.get("/locations/{location_id}", response_model=LocationResponse)
+def get_location(location_id: int, db: Session = Depends(get_db)):
+    return _get_location_or_404(db, location_id)
+
+
+@app.put("/locations/{location_id}", response_model=LocationResponse)
+def update_location(location_id: int, body: LocationCreate, db: Session = Depends(get_db)):
+    loc = _get_location_or_404(db, location_id)
+    old = (loc.description_source, loc.latitude, loc.longitude)
+    loc.name, loc.description_vi, loc.target_languages = body.name, body.description_vi, body.target_languages
+    loc.description_source = body.description_vi
+    loc.latitude, loc.longitude = body.latitude, body.longitude
+    loc.radius = body.radius if body.latitude is not None else None
+    if old != (loc.description_source, loc.latitude, loc.longitude):
+        _invalidate_narrations(db, loc)  # chỉ đổi name/target_languages/radius thì giữ cache
+    db.commit()
+    db.refresh(loc)
+    return loc
+
+
+@app.delete("/locations/{location_id}")
+def delete_location(location_id: int, db: Session = Depends(get_db)):
+    loc = _get_location_or_404(db, location_id)
+    db.execute(delete(NarrationCache).where(NarrationCache.location_id == location_id))
+    db.delete(loc)
+    db.commit()
+    return {"deleted": True, "id": location_id}
+
+
+# --- Narration cache + is_ready ---
 @app.get("/locations/{location_id}/narrations/{language}")
 def get_narration(location_id: int, language: str, db: Session = Depends(get_db)):
-    """Cache hit (còn hạn) -> {cache_hit:true, narration:{...}}; ngược lại miss."""
     _get_location_or_404(db, location_id)
     _check_language(language)
     row = _find_narration(db, location_id, language)
-    if row is None or row.expires_at <= utcnow():  # chưa có hoặc đã hết hạn
+    if row is None or row.expires_at <= utcnow():  # chưa có hoặc hết hạn = miss
         return {"cache_hit": False, "narration": None}
     return {"cache_hit": True, "narration": narration_to_dict(row)}
 
 
 @app.put("/locations/{location_id}/narrations/{language}")
-def put_narration(
-    location_id: int, language: str, body: NarrationPut, db: Session = Depends(get_db)
-):
+def put_narration(location_id: int, language: str, body: NarrationPut, db: Session = Depends(get_db)):
     """Upsert 1 narration theo (location_id, requested_lang=language)."""
     location = _get_location_or_404(db, location_id)
     _check_language(language)
-
-    if body.requested_lang is not None and body.requested_lang != language:
+    if body.requested_lang not in (None, language):
         raise HTTPException(422, "requested_lang trong body phải khớp {language} trên path")
-    if body.is_fallback and body.lang == language:
-        raise HTTPException(422, "is_fallback=true nhưng lang trùng requested_lang")
-    if not body.is_fallback and body.lang != language:
-        raise HTTPException(422, "lang khác requested_lang thì phải is_fallback=true")
+    if body.is_fallback == (body.lang == language):
+        raise HTTPException(422, "is_fallback=true khi và chỉ khi lang khác requested_lang")
 
     now = utcnow()
     expires_at = body.expires_at
@@ -881,66 +541,56 @@ def put_narration(
             expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
         if expires_at <= now:
             raise HTTPException(422, "expires_at phải ở tương lai")
-    else:
-        expires_at = now + narration_ttl()
+    values = body.model_dump(exclude={"requested_lang", "expires_at"})
+    values.update(expires_at=expires_at or now + narration_ttl(), updated_at=now)
 
-    values = dict(
-        lang=body.lang, text=body.text, source_url=body.source_url,
-        target_title=body.target_title, is_fallback=body.is_fallback,
-        reason=body.reason, voice=body.voice, text_hash=body.text_hash,
-        audio_filename=body.audio_filename, audio_status=body.audio_status,
-        expires_at=expires_at, updated_at=now,
-    )
-
-    def apply(row):
-        for key, value in values.items():
-            setattr(row, key, value)
-
-    created = False
-    row = _find_narration(db, location_id, language)
-    try:
-        if row is None:
-            row = NarrationCache(location_id=location_id, requested_lang=language,
-                                 created_at=now, **values)
-            db.add(row)
-            created = True
-        else:
-            apply(row)
+    def save(row):
+        for k, v in values.items():
+            setattr(row, k, v)
         _recompute_is_ready(db, location)
         db.commit()
-    except IntegrityError:
-        # Hai PUT cùng key chạy đồng thời (hoặc location vừa bị xóa).
+
+    row, created = _find_narration(db, location_id, language), False
+    try:
+        if row is None:
+            row, created = NarrationCache(location_id=location_id, requested_lang=language,
+                                          created_at=now, **values), True
+            db.add(row)
+            _recompute_is_ready(db, location)
+            db.commit()
+        else:
+            save(row)
+    except IntegrityError:  # 2 PUT cùng key đồng thời (hoặc location vừa bị xóa)
         db.rollback()
-        if db.get(Location, location_id) is None:
+        location = db.get(Location, location_id)
+        if location is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy địa điểm")
-        row = _find_narration(db, location_id, language)
+        row, created = _find_narration(db, location_id, language), False
         if row is None:
             raise HTTPException(status_code=409, detail="Xung đột khi lưu cache, thử lại")
-        created = False
-        apply(row)
-        _recompute_is_ready(db, db.get(Location, location_id))
-        db.commit()
-
+        save(row)
     db.refresh(row)
     return {"created": created, "narration": narration_to_dict(row)}
 
 
+@app.delete("/locations/{location_id}/narrations/{language}")
+def delete_narration(location_id: int, language: str, db: Session = Depends(get_db)):
+    """B loại cache hỏng/hết hạn. Idempotent: key chưa có vẫn 200 (deleted=false)."""
+    location = _get_location_or_404(db, location_id)
+    _check_language(language)
+    row = _find_narration(db, location_id, language)
+    if row is not None:
+        db.delete(row)
+    _recompute_is_ready(db, location)
+    db.commit()
+    return {"deleted": row is not None, "id": location_id, "language": language}
+
+
 @app.patch("/locations/{location_id}/mark-ready")
 def mark_ready(location_id: int, db: Session = Depends(get_db)):
-    """
-    Tính lại is_ready TỪ CACHE (không nhận giá trị từ client). is_ready=true
-    chỉ nghĩa là có ít nhất 1 ngôn ngữ đã audio_ready còn hạn.
-    """
+    """Tính lại is_ready TỪ CACHE (không nhận giá trị từ client)."""
     location = _get_location_or_404(db, location_id)
     ready = _recompute_is_ready(db, location)
     db.commit()
-    languages = db.execute(
-        select(NarrationCache.requested_lang)
-        .where(
-            NarrationCache.location_id == location_id,
-            NarrationCache.audio_status == "audio_ready",
-            NarrationCache.expires_at > utcnow(),
-        )
-        .order_by(NarrationCache.requested_lang)
-    ).scalars().all()
-    return {"id": location_id, "is_ready": ready, "audio_ready_languages": list(languages)}
+    return {"id": location_id, "is_ready": ready,
+            "audio_ready_languages": _ready_languages(db, location_id)}

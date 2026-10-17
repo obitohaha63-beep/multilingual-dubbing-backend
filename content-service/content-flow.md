@@ -1,4 +1,4 @@
-# Luồng dữ liệu của content-service (Tuần 3 + 4)
+# Luồng dữ liệu của content-service (Tuần 3 + 4 + 5)
 
 Content (A, port 8001) là **chủ sở hữu duy nhất của SQLite**. Các service
 khác chỉ nói chuyện với nó qua REST.
@@ -30,6 +30,10 @@ Gateway ── GET /locations/nearby ──▶ Content ── SQLite (Haversine)
 - `discovery radius` 500m chỉ để TÌM bài; `activation radius` (cột `radius`,
   mặc định 80m) mới quyết định phát. Content chỉ trả `distance_m`; Gateway so sánh.
 - Cache hit của discovery **không** đổi `last_synced_at`.
+- Wikimedia lỗi (429/timeout/5xx): nếu SQLite đã có bài Wikimedia trong bán kính
+  thì trả dữ liệu cũ kèm `stale=true`; nếu không có thì `503` + `detail.code`.
+  Không bao giờ biến lỗi upstream thành `candidates: []`. `/nearby` không bao
+  giờ gọi Wikimedia.
 
 ## 3. Luồng narration (Tuần 4)
 
@@ -55,6 +59,7 @@ Lỗi TTS: dừng ở bước 2, text vẫn được lưu để client đọc b�
 | `PUT /locations/{id}` đổi nội dung nguồn hoặc tọa độ | xóa mọi narration của địa điểm, `is_ready=false` |
 | discover fetch thật, bài wiki đổi nội dung/tọa độ | như trên |
 | `DELETE /locations/{id}` | xóa narration của địa điểm (không để dòng mồ côi) |
+| `DELETE /locations/{id}/narrations/{lang}` | B chủ động loại 1 cache hỏng; `is_ready` tính lại |
 | chỉ đổi `name` / `target_languages` / `radius` | giữ cache |
 
 ## 5. Ba loại "cache" cần phân biệt
@@ -71,3 +76,12 @@ Lỗi TTS: dừng ở bước 2, text vẫn được lưu để client đọc b�
 `is_ready` **không** thay thế cache theo ngôn ngữ: `is_ready=true` chỉ nói
 "có ít nhất 1 ngôn ngữ đã có MP3". Muốn biết ngôn ngữ cụ thể đã sẵn sàng chưa
 phải `GET .../narrations/{language}`.
+
+## 6. Vì sao B gọi Content qua HTTP, không dùng chung file SQLite
+
+- **Một chủ sở hữu**: chỉ Content mở `content.db`, nên chỉ Content giữ khóa
+  ngoại, TTL, unique và invalidation. B/C ghi thẳng file thì có thể làm lệch
+  `is_ready`, ghi dòng mồ côi hoặc bỏ qua validate `audio_filename`.
+- **Không khóa chéo**: SQLite là 1 file, nhiều process ghi cùng lúc dễ `database is locked`.
+- **Tách service**: mỗi service chạy trong container riêng; đổi schema chỉ sửa
+  Content, B/C chỉ cần hợp đồng REST.
