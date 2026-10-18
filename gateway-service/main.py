@@ -35,6 +35,7 @@ TTS_SERVICE_URL = os.getenv("TTS_SERVICE_URL", "http://translate-audio-service:8
 
 # HTTP client timeouts (giây)
 DEFAULT_TIMEOUT = float(os.getenv("GATEWAY_TIMEOUT", "6.0"))
+GATEWAY_NARRATE_TIMEOUT = float(os.getenv("GATEWAY_NARRATE_TIMEOUT", "30.0"))
 
 ALLOWED_LANGS = {"vi", "en", "ja"}
 CLIENT_DIR = Path(__file__).resolve().parent / "client"
@@ -269,23 +270,103 @@ async def detect_location(req: DetectRequest):
 
     # Có candidates nhưng kiểm tra activation
     if active_candidate:
-        # Nằm trong bán kính kích hoạt
+        # Nằm trong bán kính kích hoạt -> Gọi B /narrate
         dist = active_candidate.get("distance_m")
         source_url = active_candidate.get("source_url")
-        return DetectResponse(
-            detected=True,
-            reason=None,
-            location=active_candidate,
-            distance_m=round(dist, 1) if dist is not None else None,
-            requested_lang=req.language,
-            lang=None,
-            translated_text=None,
-            audio_url=None,
-            source_url=source_url,
-            is_fallback=False,
-            narration_status="not_implemented",
-            candidates=candidates,
-        )
+
+        source_title = str(active_candidate.get("source_title") or active_candidate.get("name") or "Địa điểm").strip()
+        source_lang = active_candidate.get("source_lang") or "vi"
+        if source_lang not in ALLOWED_LANGS:
+            source_lang = "vi"
+        source_text = str(
+            active_candidate.get("description_source")
+            or active_candidate.get("description_vi")
+            or active_candidate.get("name")
+            or "Không có mô tả"
+        ).strip()
+        source_page_id = str(active_candidate.get("source_page_id") or "0")
+        if not source_page_id.lstrip("-").isdigit():
+            source_page_id = "0"
+
+        narrate_payload = {
+            "location_id": int(active_candidate["id"]),
+            "source_title": source_title,
+            "source_lang": source_lang,
+            "target_lang": req.language,
+            "source_text": source_text,
+            "source_page_id": source_page_id,
+            "source_url": source_url,
+        }
+
+        narrate_timeout = httpx.Timeout(GATEWAY_NARRATE_TIMEOUT, connect=5.0, read=GATEWAY_NARRATE_TIMEOUT)
+        try:
+            async with httpx.AsyncClient(timeout=narrate_timeout) as narrate_client:
+                narrate_resp = await narrate_client.post(
+                    f"{TTS_SERVICE_URL}/narrate",
+                    json=narrate_payload,
+                )
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            # Lỗi mạng hoặc timeout từ B
+            return DetectResponse(
+                detected=True,
+                reason="narrate_unavailable",
+                location=active_candidate,
+                distance_m=round(dist, 1) if dist is not None else None,
+                requested_lang=req.language,
+                lang=None,
+                translated_text=None,
+                audio_url=None,
+                source_url=source_url,
+                is_fallback=False,
+                narration_status="error",
+                candidates=candidates,
+            )
+
+        if narrate_resp.status_code == 200:
+            b_data = narrate_resp.json()
+            raw_audio_url = b_data.get("audio_url")
+            public_audio_url = None
+            if raw_audio_url:
+                # Đổi sang relative URL /audio/<filename>.mp3 cùng origin Gateway
+                audio_filename = b_data.get("audio_filename") or raw_audio_url.split("/")[-1]
+                public_audio_url = f"/audio/{audio_filename}"
+
+            return DetectResponse(
+                detected=True,
+                reason=b_data.get("reason"),
+                location=active_candidate,
+                distance_m=round(dist, 1) if dist is not None else None,
+                requested_lang=b_data.get("requested_lang", req.language),
+                lang=b_data.get("lang"),
+                translated_text=b_data.get("translated_text"),
+                audio_url=public_audio_url,
+                source_url=b_data.get("source_url") or source_url,
+                is_fallback=b_data.get("is_fallback", False),
+                narration_status=b_data.get("narration_status", "audio_ready"),
+                candidates=candidates,
+            )
+        else:
+            # B trả lỗi 4xx hoặc 5xx
+            try:
+                err_data = narrate_resp.json()
+                detail = err_data.get("detail", narrate_resp.text)
+            except Exception:
+                detail = narrate_resp.text
+
+            return DetectResponse(
+                detected=True,
+                reason=f"narrate_error: {detail}",
+                location=active_candidate,
+                distance_m=round(dist, 1) if dist is not None else None,
+                requested_lang=req.language,
+                lang=None,
+                translated_text=None,
+                audio_url=None,
+                source_url=source_url,
+                is_fallback=False,
+                narration_status="error",
+                candidates=candidates,
+            )
     else:
         # Có địa điểm trong 500m nhưng ngoài bán kính kích hoạt (activation radius)
         closest = candidates[0]
