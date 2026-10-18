@@ -160,10 +160,12 @@ def test_detect_accuracy_valid():
 # 3. Detect Flow & Business Logic
 # ===========================================================================
 
-def test_detect_inside_activation_radius():
+def test_detect_inside_activation_radius_audio_ready():
     """
-    Candidate có khoảng cách 40m <= radius 80m -> Kích hoạt!
-    detected=True, narration_status='not_implemented' (tuần 3 chưa phát audio)
+    Candidate có khoảng cách 40.5m <= radius 80m -> Kích hoạt!
+    Gateway gọi B /narrate và B trả về 200 với audio_ready:
+    - audio_url được chuyển sang URL public cùng origin: /audio/<filename>.mp3
+    - narration_status='audio_ready', detected=True
     """
     mock_candidate = {
         "id": 1,
@@ -174,16 +176,40 @@ def test_detect_inside_activation_radius():
         "distance_m": 40.5,
         "source": "wikimedia",
         "source_url": "https://vi.wikipedia.org/wiki/Nh%C3%A0_th%E1%BB%9D_%C4%90%E1%BB%A9c_B%C3%A0_S%C3%A0i_G%C3%B2n",
-        "description_source": "Nhà thờ chính tòa Đức Bà Sài Gòn..."
+        "description_source": "Nhà thờ chính tòa Đức Bà Sài Gòn...",
+        "source_lang": "vi",
+        "source_page_id": "12345",
     }
 
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.is_error = False
-        mock_resp.is_server_error = False
-        mock_resp.json.return_value = {"candidates": [mock_candidate]}
-        mock_get.return_value = mock_resp
+    mock_b_resp = {
+        "requested_lang": "vi",
+        "lang": "vi",
+        "translated_text": "Bản thuyết minh tiếng Việt hoàn chỉnh...",
+        "audio_url": "http://translate-audio-service:8002/audio/ducba_vi_abc123.mp3",
+        "audio_filename": "ducba_vi_abc123.mp3",
+        "voice": "vi-VN-HoaiMyNeural",
+        "text_hash": "abc123hash",
+        "source_url": mock_candidate["source_url"],
+        "is_fallback": False,
+        "reason": None,
+        "narration_status": "audio_ready",
+        "cache_hit": True,
+    }
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        resp_get = MagicMock()
+        resp_get.status_code = 200
+        resp_get.is_error = False
+        resp_get.is_server_error = False
+        resp_get.json.return_value = {"candidates": [mock_candidate]}
+        mock_get.return_value = resp_get
+
+        resp_post = MagicMock()
+        resp_post.status_code = 200
+        resp_post.is_error = False
+        resp_post.json.return_value = mock_b_resp
+        mock_post.return_value = resp_post
 
         resp = client.post(
             "/locations/detect",
@@ -196,16 +222,163 @@ def test_detect_inside_activation_radius():
         assert data["reason"] is None
         assert data["location"]["name"] == "Nhà thờ Đức Bà"
         assert data["distance_m"] == 40.5
-        assert data["narration_status"] == "not_implemented"
+        assert data["narration_status"] == "audio_ready"
+        assert data["audio_url"] == "/audio/ducba_vi_abc123.mp3"
+        assert data["translated_text"] == "Bản thuyết minh tiếng Việt hoàn chỉnh..."
+        assert data["lang"] == "vi"
+        assert data["is_fallback"] is False
+        assert mock_post.called
+
+
+def test_detect_inside_activation_radius_text_ready():
+    """
+    Candidate kích hoạt, B /narrate trả text_ready (TTS của B lỗi nhưng có văn bản):
+    - narration_status='text_ready'
+    - audio_url=None
+    - translated_text và lang sẵn sàng cho client Web SpeechSynthesis
+    """
+    mock_candidate = {
+        "id": 1,
+        "name": "Nhà thờ Đức Bà",
+        "latitude": 10.77978,
+        "longitude": 106.69902,
+        "radius": 80.0,
+        "distance_m": 40.5,
+        "source": "wikimedia",
+        "source_url": "https://vi.wikipedia.org/wiki/Nh%C3%A0_th%E1%BB%9D_%C4%90%E1%BB%A9c_B%C3%A0_S%C3%A0i_G%C3%B2n",
+        "description_source": "Nhà thờ chính tòa Đức Bà Sài Gòn...",
+    }
+
+    mock_b_resp = {
+        "requested_lang": "vi",
+        "lang": "vi",
+        "translated_text": "Văn bản thuyết minh dùng cho Web Speech",
+        "audio_url": None,
+        "audio_filename": None,
+        "voice": None,
+        "text_hash": "xyzhash",
+        "source_url": mock_candidate["source_url"],
+        "is_fallback": False,
+        "reason": "tts_error: Edge TTS failed, fallback to text",
+        "narration_status": "text_ready",
+        "cache_hit": False,
+    }
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        resp_get = MagicMock()
+        resp_get.status_code = 200
+        resp_get.is_error = False
+        resp_get.is_server_error = False
+        resp_get.json.return_value = {"candidates": [mock_candidate]}
+        mock_get.return_value = resp_get
+
+        resp_post = MagicMock()
+        resp_post.status_code = 200
+        resp_post.is_error = False
+        resp_post.json.return_value = mock_b_resp
+        mock_post.return_value = resp_post
+
+        resp = client.post(
+            "/locations/detect",
+            json={"latitude": 10.7797, "longitude": 106.6990, "language": "vi"}
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["detected"] is True
+        assert data["narration_status"] == "text_ready"
+        assert data["audio_url"] is None
+        assert data["translated_text"] == "Văn bản thuyết minh dùng cho Web Speech"
+        assert data["lang"] == "vi"
+
+
+def test_detect_inside_radius_b_server_error():
+    """
+    Khi B bị lỗi 500 hoặc 503 và không có text:
+    - narration_status='error'
+    - Tuyệt đối không giả là narration thành công
+    """
+    mock_candidate = {
+        "id": 1,
+        "name": "Nhà thờ Đức Bà",
+        "latitude": 10.77978,
+        "longitude": 106.69902,
+        "radius": 80.0,
+        "distance_m": 40.5,
+        "source": "wikimedia",
+    }
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        resp_get = MagicMock()
+        resp_get.status_code = 200
+        resp_get.is_error = False
+        resp_get.is_server_error = False
+        resp_get.json.return_value = {"candidates": [mock_candidate]}
+        mock_get.return_value = resp_get
+
+        resp_post = MagicMock()
+        resp_post.status_code = 503
+        resp_post.is_error = True
+        resp_post.json.return_value = {"detail": "Translation service down"}
+        mock_post.return_value = resp_post
+
+        resp = client.post(
+            "/locations/detect",
+            json={"latitude": 10.7797, "longitude": 106.6990, "language": "vi"}
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["detected"] is True
+        assert data["narration_status"] == "error"
+        assert "narrate_error" in data["reason"]
         assert data["audio_url"] is None
         assert data["translated_text"] is None
-        assert data["source_url"] == mock_candidate["source_url"]
 
 
-def test_detect_outside_activation_radius():
+def test_detect_inside_radius_b_timeout():
     """
-    Candidate có khoảng cách 150m > radius 80m -> Không kích hoạt.
-    detected=False, reason='outside_activation_radius'
+    Khi gọi B bị Timeout:
+    - Gateway trả narration_status='error', reason='narrate_unavailable'
+    """
+    mock_candidate = {
+        "id": 1,
+        "name": "Nhà thờ Đức Bà",
+        "latitude": 10.77978,
+        "longitude": 106.69902,
+        "radius": 80.0,
+        "distance_m": 40.5,
+    }
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+         patch("httpx.AsyncClient.post", side_effect=httpx.ReadTimeout("Timeout from B")):
+        resp_get = MagicMock()
+        resp_get.status_code = 200
+        resp_get.is_error = False
+        resp_get.is_server_error = False
+        resp_get.json.return_value = {"candidates": [mock_candidate]}
+        mock_get.return_value = resp_get
+
+        resp = client.post(
+            "/locations/detect",
+            json={"latitude": 10.7797, "longitude": 106.6990, "language": "vi"}
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["detected"] is True
+        assert data["narration_status"] == "error"
+        assert data["reason"] == "narrate_unavailable"
+        assert data["audio_url"] is None
+
+
+def test_detect_outside_activation_radius_never_calls_b():
+    """
+    Candidate có khoảng cách 150m > radius 80m:
+    - detected=False, reason='outside_activation_radius'
+    - TUYỆT ĐỐI KHÔNG GỌI B (/narrate)
     """
     mock_candidate = {
         "id": 2,
@@ -218,10 +391,8 @@ def test_detect_outside_activation_radius():
         "source_url": "https://vi.wikipedia.org/wiki/Ch%E1%BB%A3_B%E1%BA%BFn_Th%C3%A0nh"
     }
 
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-        # Lần 1: /nearby -> có candidate nhưng ngoài radius
-        # Hệ thống gọi /discover để tìm xem có địa điểm nào gần hơn không
-        # Giả sử sau discover vẫn là candidate đó
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.is_error = False
@@ -241,6 +412,8 @@ def test_detect_outside_activation_radius():
         assert data["location"]["id"] == 2
         assert data["distance_m"] == 150.0
         assert data["narration_status"] is None
+        # Khẳng định B không được gọi
+        mock_post.assert_not_called()
 
 
 def test_detect_triggers_discovery_and_finds_new_place():
@@ -274,7 +447,21 @@ def test_detect_triggers_discovery_and_finds_new_place():
             resp.json.return_value = {"candidates": [candidate], "cache_hit": False}
         return resp
 
-    with patch("httpx.AsyncClient.get", side_effect=custom_get):
+    with patch("httpx.AsyncClient.get", side_effect=custom_get), \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        resp_post = MagicMock()
+        resp_post.status_code = 200
+        resp_post.is_error = False
+        resp_post.json.return_value = {
+            "requested_lang": "vi",
+            "lang": "vi",
+            "translated_text": "Dinh Độc Lập...",
+            "audio_url": "http://translate-audio-service:8002/audio/dinhdoclap.mp3",
+            "audio_filename": "dinhdoclap.mp3",
+            "narration_status": "audio_ready",
+        }
+        mock_post.return_value = resp_post
+
         resp = client.post(
             "/locations/detect",
             json={"latitude": 10.777, "longitude": 106.695, "language": "vi"}
@@ -284,14 +471,18 @@ def test_detect_triggers_discovery_and_finds_new_place():
         assert data["detected"] is True
         assert data["location"]["name"] == "Dinh Độc Lập"
         assert data["distance_m"] == 35.0
+        assert data["narration_status"] == "audio_ready"
+        assert data["audio_url"] == "/audio/dinhdoclap.mp3"
 
 
-def test_detect_no_place_found():
+def test_detect_no_place_found_never_calls_b():
     """
-    Sau cả Nearby và Discover đều không có địa điểm nào trong 500m.
-    detected=False, reason='no_place_found'
+    Sau cả Nearby và Discover đều không có địa điểm nào trong 500m:
+    - detected=False, reason='no_place_found'
+    - TUYỆT ĐỐI KHÔNG GỌI B (/narrate)
     """
-    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.is_error = False
@@ -308,6 +499,7 @@ def test_detect_no_place_found():
         assert data["detected"] is False
         assert data["reason"] == "no_place_found"
         assert data["location"] is None
+        mock_post.assert_not_called()
 
 
 def test_detect_upstream_timeout_error():
