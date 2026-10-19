@@ -1,8 +1,9 @@
 services:
-  gps-audio-guide:
-    name: gps-audio-guide
+  - name: gps-audio-guide
     type: web
     runtime: docker
+    repo: https://github.com/obitohaha63-beep/multilingual-dubbing-backend
+    branch: main
     dockerfilePath: ./render.Dockerfile
     # Render build tu root cua repo, context la thu muc goc
     dockerContext: .
