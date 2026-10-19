@@ -36,3 +36,15 @@ services:
       # --- Cache TTL ---
       - key: NARRATION_TTL_DAYS
         value: "7"
+      # --- Cau hinh Admin Dashboard (Bao mat) ---
+      - key: ADMIN_PATH
+        # Vi du: /admin-sec-9f82a/ (khong dung duong dan mac dinh)
+        value: "/admin-dashboard/"
+      - key: ADMIN_USERNAME
+        value: "admin"
+      - key: ADMIN_PASSWORD
+        # Mat khau quan tri - dien tren Render Dashboard
+        sync: false
+      - key: ADMIN_SESSION_SECRET
+        # Render tu dong sinh chuoi ngau nhien manh
+        generateValue: true

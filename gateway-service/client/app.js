@@ -300,6 +300,46 @@ class TourStateManager {
     return; // Môi trường Node.js (test runner)
   }
 
+  // --- Analytics Client Identifier & Heartbeat (Ẩn danh, không lưu IP/GPS) ---
+  function getOrCreateClientId() {
+    let cid = "";
+    try {
+      cid = localStorage.getItem("gps_anon_cid") || "";
+      if (!cid || cid.length < 16) {
+        cid = "cid_" + Math.random().toString(36).substring(2, 15) + "_" + Date.now().toString(36);
+        localStorage.setItem("gps_anon_cid", cid);
+      }
+    } catch (e) {
+      cid = "cid_" + Math.random().toString(36).substring(2, 15) + "_" + Date.now().toString(36);
+    }
+    return cid;
+  }
+
+  const anonClientId = getOrCreateClientId();
+
+  // Gửi lượt xem trang duy nhất (Page View) khi load giao diện /app/
+  try {
+    fetch("/analytics/pageview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_id: anonClientId, path: window.location.pathname }),
+    }).catch(() => {});
+  } catch (e) {}
+
+  // Gửi heartbeat định kỳ mỗi 30s để ước tính khách đang online (90s window)
+  function sendHeartbeat() {
+    try {
+      fetch("/analytics/heartbeat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: anonClientId }),
+      }).catch(() => {});
+    } catch (e) {}
+  }
+
+  sendHeartbeat();
+  setInterval(sendHeartbeat, 30000);
+
   const manager = new TourStateManager();
 
   // Watch & Timer IDs
