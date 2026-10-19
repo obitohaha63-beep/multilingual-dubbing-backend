@@ -33,3 +33,10 @@ audio_files/
 Thumbs.db
 .idea/
 .vscode/
+
+# Test artifacts
+*.log
+test.mp3
+test.txt
+test-upbranch.txt
+test-upbranch-congthanh.txt

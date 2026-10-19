@@ -4,4 +4,4 @@ pytest
 httpx
 httpx2
 pydantic
-edge-tts
+edge-tts>=7.3.1
