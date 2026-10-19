@@ -37,6 +37,30 @@
         </button>
       </section>
 
+      <!-- Section: Giả lập GPS nhanh (Dành cho kiểm thử trên máy tính) -->
+      <section class="card config-card">
+        <details id="mock-gps-details" open>
+          <summary class="section-label" style="cursor: pointer; font-weight: 600;">📍 Giả lập GPS nhanh (Tránh timeout khi test trên máy tính)</summary>
+          <p style="font-size: 0.85rem; color: #64748b; margin: 6px 0 10px 0;">
+            Máy tính bàn / laptop thường không có GPS vệ tinh. Bấm nút dưới đây để giả lập vị trí ngay lập tức:
+          </p>
+          <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+            <button id="btn-mock-ducba" class="btn btn-secondary btn-sm" type="button">
+              ⛪ Nhà thờ Đức Bà
+            </button>
+            <button id="btn-mock-dinhdoclap" class="btn btn-secondary btn-sm" type="button">
+              🏛️ Dinh Độc Lập
+            </button>
+            <button id="btn-mock-buudien" class="btn btn-secondary btn-sm" type="button">
+              📮 Bưu điện TP
+            </button>
+            <button id="btn-mock-far" class="btn btn-warning btn-sm" type="button">
+              🚶 Đi xa (>500m)
+            </button>
+          </div>
+        </details>
+      </section>
+
       <!-- Section: Trạng thái hệ thống -->
       <section class="card status-card">
         <h2 class="card-title">Trạng thái hệ thống</h2>

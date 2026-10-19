@@ -602,7 +602,7 @@ class TourStateManager {
         msg = "Vị trí không khả dụng (Unavailable)";
         break;
       case err.TIMEOUT:
-        msg = "Hết thời gian chờ GPS (Timeout)";
+        msg = "Hết thời gian chờ GPS (Timeout - hãy thử bấm nút Giả lập GPS)";
         break;
     }
     setGpsStatus(msg, "badge-danger");
@@ -767,6 +767,19 @@ class TourStateManager {
     btnStart.disabled = true;
     btnStop.disabled = false;
 
+    // Mở khóa autoplay audio bằng cử chỉ click của người dùng
+    if (audioElement) {
+      try {
+        audioElement.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+        const p = audioElement.play();
+        if (p !== undefined) {
+          p.then(() => {
+            audioElement.pause();
+          }).catch(() => {});
+        }
+      } catch (e) {}
+    }
+
     manager.setLanguage(langSelect.value);
 
     watchId = navigator.geolocation.watchPosition(onGpsSuccess, onGpsError, {
@@ -868,6 +881,44 @@ class TourStateManager {
         playNarration(currentNarrationPayload, true);
       }
     });
+  }
+
+  // Tiện ích Giả lập vị trí GPS nhanh (dành cho môi trường test trên máy tính)
+  function simulateGpsFix(lat, lon, accuracy = 10) {
+    if (btnStart && !btnStart.disabled) {
+      startTracking();
+    }
+    const fakePosition = {
+      coords: {
+        latitude: lat,
+        longitude: lon,
+        accuracy: accuracy,
+        altitude: null,
+        altitudeAccuracy: null,
+        heading: null,
+        speed: null,
+      },
+      timestamp: Date.now(),
+    };
+    onGpsSuccess(fakePosition);
+  }
+
+  const btnMockDucBa = document.getElementById("btn-mock-ducba");
+  const btnMockDinhDocLap = document.getElementById("btn-mock-dinhdoclap");
+  const btnMockBuuDien = document.getElementById("btn-mock-buudien");
+  const btnMockFar = document.getElementById("btn-mock-far");
+
+  if (btnMockDucBa) {
+    btnMockDucBa.addEventListener("click", () => simulateGpsFix(10.77978, 106.69902));
+  }
+  if (btnMockDinhDocLap) {
+    btnMockDinhDocLap.addEventListener("click", () => simulateGpsFix(10.7770, 106.6954));
+  }
+  if (btnMockBuuDien) {
+    btnMockBuuDien.addEventListener("click", () => simulateGpsFix(10.7798, 106.6999));
+  }
+  if (btnMockFar) {
+    btnMockFar.addEventListener("click", () => simulateGpsFix(10.7500, 106.6500));
   }
 })();
 
