@@ -23,6 +23,11 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 app = FastAPI(title="gateway-service")
 
+@app.get("/", include_in_schema=False)
+def home():
+    return RedirectResponse(url="/app/", status_code=302)
+
+
 # Regex validate tên file MP3 an toàn chống path traversal
 SAFE_AUDIO_FILENAME_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp3$",

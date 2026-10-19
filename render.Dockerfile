@@ -7,9 +7,10 @@
 
 FROM python:3.11-slim
 
-# Cai supervisord (quan ly nhieu tien trinh) va cac goi he thong can thiet
+# Cai supervisord (quan ly nhieu tien trinh) va dos2unix (chuan hoa line ending)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
+    dos2unix \
     && rm -rf /var/lib/apt/lists/*
 
 # Tao thu muc ung dung
@@ -29,6 +30,10 @@ RUN pip install --no-cache-dir \
 COPY content-service/         /app/content-service/
 COPY gateway-service/         /app/gateway-service/
 COPY translate-audio-service/ /app/translate-audio-service/
+
+# Chuan hoa line ending sang Unix LF va cap quyen thuc thi cho start.sh
+RUN dos2unix /app/gateway-service/start.sh \
+    && chmod +x /app/gateway-service/start.sh
 
 # Tao thu muc du lieu runtime (SQLite DB va file am thanh MP3)
 RUN mkdir -p /app/data /app/audio_files
