@@ -1,0 +1,37 @@
+services:
+  gps-audio-guide:
+    name: gps-audio-guide
+    type: web
+    runtime: docker
+    dockerfilePath: ./render.Dockerfile
+    # Render build tu root cua repo, context la thu muc goc
+    dockerContext: .
+    # Khong set region cu the de Render chon may chu phong hop voi free tier
+    plan: free
+    healthCheckPath: /health
+    # Bien moi truong bat buoc - phai dien gia tri thuc trong Render Dashboard
+    envVars:
+      # --- Cau hinh Wikimedia ---
+      - key: WIKIMEDIA_USER_AGENT
+        # Vi du: "ten-ung-dung/1.0 (email@example.com)"
+        # Khong duoc de trong - Wikimedia yeu cau User-Agent ro rang
+        value: multilingual-dubbing/1.0 (contact@example.com)
+      # --- Cau hinh TTS ---
+      - key: TTS_TIMEOUT_SECONDS
+        value: "25.0"
+      - key: TTS_CONFIG_VERSION
+        value: "v1"
+      - key: TTS_VOICE_VI
+        value: "vi-VN-HoaiMyNeural"
+      - key: TTS_VOICE_EN
+        value: "en-US-JennyNeural"
+      - key: TTS_VOICE_JA
+        value: "ja-JP-NanamiNeural"
+      # --- Cau hinh Gateway ---
+      - key: GATEWAY_TIMEOUT
+        value: "6.0"
+      - key: GATEWAY_NARRATE_TIMEOUT
+        value: "30.0"
+      # --- Cache TTL ---
+      - key: NARRATION_TTL_DAYS
+        value: "7"
