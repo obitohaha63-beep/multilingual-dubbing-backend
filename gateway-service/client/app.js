@@ -239,6 +239,12 @@ class TourStateManager {
     }
 
     // 4. Kiểm tra playedKeys cho cặp (location_id, requested_lang)
+    if (["pending", "processing"].includes(response.narration_status)) {
+      return { action: "wait_generation", switchedLocation, data: response };
+    }
+    if (response.narration_status === "error") {
+      return { action: "generation_error", switchedLocation, data: response };
+    }
     const key = `${locId}:${response.requested_lang || lang}`;
     if (this.playedKeys.has(key)) {
       return {
@@ -555,7 +561,7 @@ class TourStateManager {
 
     if (audio_url) {
       // 1. Phát qua MP3 từ Gateway (same origin)
-      if (playerSource) playerSource.textContent = `File MP3 Gateway (${audio_url})`;
+      if (playerSource) playerSource.textContent = "Bản thuyết minh MP3";
       audioElement.src = audio_url;
       audioElement.muted = isMuted;
 
@@ -696,6 +702,12 @@ class TourStateManager {
       }
 
       renderDetectResult(data);
+      if (evalResult.switchedLocation && evalResult.action !== "play") {
+        stopCurrentAudio();
+        currentNarrationPayload = null;
+        if (btnAudioReplay) btnAudioReplay.disabled = true;
+        if (playerText) playerText.textContent = "Đang chờ bản thuyết minh mới...";
+      }
 
       if (evalResult.action === "play") {
         if (evalResult.switchedLocation) {
@@ -744,11 +756,12 @@ class TourStateManager {
 
       let statusLabel = data.narration_status || "--";
       if (data.narration_status === "audio_ready") statusLabel = "Sẵn sàng file âm thanh MP3";
+      if (["pending", "processing"].includes(data.narration_status)) statusLabel = "Đang biên soạn và tạo âm thanh, vui lòng chờ...";
       if (data.narration_status === "text_ready") statusLabel = "Sẵn sàng văn bản (Dùng Web Speech)";
       if (data.narration_status === "error") statusLabel = `Lỗi tạo âm thanh (${data.reason || "Xem chi tiết"})`;
       narrationStatus.textContent = statusLabel;
 
-      placeDesc.textContent = loc.description_source || loc.description_vi || "(Không có mô tả)";
+      placeDesc.textContent = data.translated_text || loc.description_source || loc.description_vi || "(Không có mô tả)";
     } else if (data.reason === "outside_activation_radius" && data.location) {
       noDetectBox.classList.add("hidden");
       detectedContent.classList.remove("hidden");
@@ -844,6 +857,10 @@ class TourStateManager {
 
   langSelect.addEventListener("change", () => {
     manager.setLanguage(langSelect.value);
+    stopCurrentAudio();
+    manager.narrationState = "idle";
+    currentNarrationPayload = null;
+    if (btnAudioReplay) btnAudioReplay.disabled = true;
     // Khi người dùng đổi ngôn ngữ, cho phép gửi lại ngay lập tức
     if (manager.lastSentFix) {
       manager.lastSentFix.timestamp = 0;

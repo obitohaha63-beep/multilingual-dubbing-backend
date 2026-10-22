@@ -63,6 +63,7 @@ class DetectRequest(BaseModel):
     longitude: float
     language: str
     accuracy_m: Optional[float] = None
+    voice: Optional[str] = None
 
     @field_validator("latitude")
     @classmethod
@@ -113,6 +114,8 @@ class DetectResponse(BaseModel):
     source_url: Optional[str] = None
     is_fallback: bool = False
     narration_status: Optional[str] = None
+    cache_hit: bool = False
+    retry_after: Optional[int] = None
     candidates: Optional[List[Dict[str, Any]]] = None
 
     model_config = ConfigDict(extra="ignore")
@@ -174,7 +177,7 @@ async def detect_location(req: DetectRequest):
        - Gọi content-service GET /locations/discover (bán kính 500m) để tìm bài viết từ Wikimedia (kèm cache)
        - Sau khi discover, gọi lại /locations/nearby và xét lại candidate kích hoạt
     4. Nếu có candidate kích hoạt (distance_m <= radius):
-       - Tuần 3: detected=True, narration_status='not_implemented', chưa gọi TTS
+       - Gọi Content /narrate, trả trạng thái chờ hoặc URL MP3 đã lưu.
     5. Nếu ngoài radius (khoảng cách > radius):
        - detected=False, reason='outside_activation_radius'
     6. Nếu không có địa điểm nào trong 500m:
@@ -283,45 +286,24 @@ async def detect_location(req: DetectRequest):
 
     # Có candidates nhưng kiểm tra activation
     if active_candidate:
-        # Nằm trong bán kính kích hoạt -> Gọi B /narrate
+        # Nằm trong bán kính kích hoạt -> Content điều phối thuyết minh
         dist = active_candidate.get("distance_m")
         source_url = active_candidate.get("source_url")
 
-        source_title = str(active_candidate.get("source_title") or active_candidate.get("name") or "Địa điểm").strip()
-        source_lang = active_candidate.get("source_lang") or "vi"
-        if source_lang not in ALLOWED_LANGS:
-            source_lang = "vi"
-        source_text = str(
-            active_candidate.get("description_source")
-            or active_candidate.get("description_vi")
-            or active_candidate.get("name")
-            or "Không có mô tả"
-        ).strip()
-        source_page_id = str(active_candidate.get("source_page_id") or "0")
-        if not source_page_id.lstrip("-").isdigit():
-            source_page_id = "0"
-
-        narrate_payload = {
-            "location_id": int(active_candidate["id"]),
-            "source_title": source_title,
-            "source_lang": source_lang,
-            "target_lang": req.language,
-            "source_text": source_text,
-            "source_page_id": source_page_id,
-            "source_url": source_url,
-        }
+        narrate_payload = {"location_id": int(active_candidate["id"]),
+                           "target_lang": req.language, "voice": req.voice}
 
         narrate_timeout = httpx.Timeout(GATEWAY_NARRATE_TIMEOUT, connect=5.0, read=GATEWAY_NARRATE_TIMEOUT)
         narrate_start_time = time.time()
         try:
             async with httpx.AsyncClient(timeout=narrate_timeout) as narrate_client:
                 narrate_resp = await narrate_client.post(
-                    f"{TTS_SERVICE_URL}/narrate",
+                    f"{CONTENT_SERVICE_URL}/narrate",
                     json=narrate_payload,
                 )
         except (httpx.TimeoutException, httpx.RequestError) as exc:
             # Ghi nhận lỗi và event thất bại
-            analytics_store.record_error_log("translate-audio-service", "POST /narrate", str(exc), 503, "NetworkError")
+            analytics_store.record_error_log("content-service", "POST /narrate", str(exc), 503, "NetworkError")
             analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", status_reason="narrate_unavailable")
             return DetectResponse(
                 detected=True,
@@ -340,11 +322,19 @@ async def detect_location(req: DetectRequest):
 
         duration_ms = round((time.time() - narrate_start_time) * 1000, 1)
 
+        if narrate_resp.status_code == 202:
+            return DetectResponse(detected=True, location=active_candidate,
+                distance_m=round(dist, 1) if dist is not None else None,
+                requested_lang=req.language, narration_status="processing",
+                retry_after=10, source_url=source_url, candidates=candidates)
+
         if narrate_resp.status_code == 200:
             b_data = narrate_resp.json()
             raw_audio_url = b_data.get("audio_url")
             public_audio_url = None
-            if raw_audio_url:
+            if raw_audio_url and raw_audio_url.startswith("https://"):
+                public_audio_url = raw_audio_url  # URL ký bởi Content Service, phát thẳng từ Storage.
+            elif raw_audio_url:
                 # Đổi sang relative URL /audio/<filename>.mp3 cùng origin Gateway
                 audio_filename = b_data.get("audio_filename") or raw_audio_url.split("/")[-1]
                 public_audio_url = f"/audio/{audio_filename}"
@@ -378,17 +368,18 @@ async def detect_location(req: DetectRequest):
                 source_url=b_data.get("source_url") or source_url,
                 is_fallback=b_data.get("is_fallback", False),
                 narration_status=b_data.get("narration_status", "audio_ready"),
+                cache_hit=b_data.get("cache_hit", False),
                 candidates=candidates,
             )
         else:
-            # B trả lỗi 4xx hoặc 5xx
+            # Content trả lỗi 4xx hoặc 5xx
             try:
                 err_data = narrate_resp.json()
                 detail = err_data.get("detail", narrate_resp.text)
             except Exception:
                 detail = narrate_resp.text
 
-            analytics_store.record_error_log("translate-audio-service", "POST /narrate", str(detail), narrate_resp.status_code, "UpstreamError")
+            analytics_store.record_error_log("content-service", "POST /narrate", str(detail), narrate_resp.status_code, "UpstreamError")
             analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", duration_ms=duration_ms, status_reason=str(detail)[:100])
 
             return DetectResponse(

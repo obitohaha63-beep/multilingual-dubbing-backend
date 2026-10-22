@@ -1,13 +1,7 @@
-"""
-Định nghĩa kết nối CSDL (SQLite) và model Location.
+"""Model địa điểm, cache API cũ và bản thuyết minh lưu lâu dài.
 
-Tuần 2: id, name, description_vi, target_languages.
-Tuần 3: bổ sung dữ liệu địa lý (GPS) + metadata nguồn Wikimedia, để phục vụ
-2 endpoint mới /locations/nearby (tìm trong các địa điểm đã lưu) và
-/locations/discover (tìm bài viết Wikimedia quanh 1 tọa độ rồi lưu lại).
-Tuần 4: thêm bảng NarrationCache - kho cache nội dung đa ngôn ngữ + thông tin
-audio của từng địa điểm (B ghi/đọc qua REST của content-service, không mở
-trực tiếp file content.db).
+Có DATABASE_URL: dùng PostgreSQL Supabase (triển khai thật).
+Không có DATABASE_URL: dùng SQLite cho CRUD/test cũ.
 """
 
 import os
@@ -27,13 +21,17 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DB_PATH = os.getenv("DB_PATH", "content.db")
-SQLALCHEMY_DATABASE_URL = (
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL") or (
     f"sqlite:///{DB_PATH}" if os.path.isabs(DB_PATH) else f"sqlite:///./{DB_PATH}"
 )
 
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
-)
+if SQLALCHEMY_DATABASE_URL.startswith("postgresql://"):
+    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+IS_SQLITE = SQLALCHEMY_DATABASE_URL.startswith("sqlite:")
+engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True,
+    **({"connect_args": {"check_same_thread": False}} if IS_SQLITE else
+       {"pool_size": 3, "max_overflow": 2, "pool_timeout": 5,
+        "connect_args": {"connect_timeout": 5, "prepare_threshold": None}}))
 
 
 @event.listens_for(engine, "connect")
@@ -43,6 +41,8 @@ def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
     PRAGMA cho TỪNG kết nối. Không bật thì narration_cache.location_id trỏ
     tới location không tồn tại vẫn được ghi vào mà không báo lỗi.
     """
+    if not IS_SQLITE:
+        return
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
@@ -141,3 +141,30 @@ class NarrationCache(Base):
             "location_id", "requested_lang", name="ux_narration_location_lang"
         ),
     )
+
+
+class Narration(Base):
+    """Bản thuyết minh bền vững. Không có TTL; mỗi phiên bản là một dòng riêng."""
+    __tablename__ = "narrations"
+    id = Column(String, primary_key=True)
+    location_id = Column(Integer, ForeignKey("locations.id", ondelete="RESTRICT"), nullable=False)
+    language = Column(String, nullable=False)
+    voice = Column(String, nullable=False)
+    content_version = Column(String, nullable=False)
+    location_snapshot = Column(Text, nullable=False)  # JSON: tên, GPS, nguồn tại lúc tạo
+    source_text = Column(Text)
+    source_url = Column(Text)
+    final_text = Column(Text)
+    text_hash = Column(String)
+    audio_filename = Column(String)
+    storage_path = Column(String)
+    status = Column(String, nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    lease_token = Column(String)
+    lease_until = Column(DateTime)
+    retry_at = Column(DateTime)
+    error_code = Column(String)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+    __table_args__ = (UniqueConstraint("location_id", "language", "voice", "content_version",
+                                       name="ux_narrations_version"),)

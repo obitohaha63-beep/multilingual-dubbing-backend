@@ -1,5 +1,11 @@
 # Multilingual Video Dubbing Backend Architecture
 
+> **Cập nhật GPS Audio Guide:** luồng mới do Content Service quản lý:
+> Wikimedia → Gemini → Edge TTS → Supabase PostgreSQL/Storage.
+> Đọc [hướng dẫn cấu hình và vận hành](docs/gemini-supabase.md),
+> chạy [SQL migration Supabase](docs/supabase-schema.sql) trước khi deploy.
+> Các mô tả SQLite/cache MP3 ở phần cũ bên dưới chỉ áp dụng cho chế độ tương thích.
+
 Hệ thống backend xử lý dịch thuật và lồng tiếng video đa ngôn ngữ được thiết kế theo kiến trúc **Microservices**.
 
 ---

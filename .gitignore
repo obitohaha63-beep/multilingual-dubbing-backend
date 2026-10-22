@@ -5,6 +5,7 @@ __pycache__/
 
 # Pytest / Caches
 .pytest_cache/
+.pytest-work*/
 .coverage
 htmlcov/
 

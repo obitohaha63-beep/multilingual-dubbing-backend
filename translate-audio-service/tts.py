@@ -192,6 +192,7 @@ async def synthesize_speech(
     lang: str,
     audio_dir: Optional[Path] = None,
     timeout_seconds: Optional[float] = None,
+    voice: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Tạo file MP3 từ văn bản qua Edge TTS hoặc trả về cache có sẵn.
@@ -232,7 +233,11 @@ async def synthesize_speech(
             f"(nhận {len(normalized_text)} ký tự)"
         )
 
-    voice = get_voice_for_lang(lang_clean)
+    default_voice = get_voice_for_lang(lang_clean)
+    allowed_voices = {default_voice, *os.getenv(f"TTS_ALLOWED_VOICES_{lang_clean.upper()}", "").split(",")}
+    voice = voice or default_voice
+    if voice not in allowed_voices or not voice.startswith(lang_clean + "-"):
+        raise ValueError("Giọng đọc không thuộc danh sách cho phép của ngôn ngữ")
     text_hash = compute_text_hash(normalized_text)
     cache_key = compute_cache_key(
         normalized_text, lang_clean, voice, TTS_CONFIG_VERSION

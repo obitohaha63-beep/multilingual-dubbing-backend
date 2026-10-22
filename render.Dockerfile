@@ -35,7 +35,8 @@ COPY translate-audio-service/ /app/translate-audio-service/
 RUN dos2unix /app/gateway-service/start.sh \
     && chmod +x /app/gateway-service/start.sh
 
-# Tao thu muc du lieu runtime (SQLite DB va file am thanh MP3)
+# Du lieu runtime tam: analytics SQLite va cache Edge TTS.
+# Dia diem/thuyet minh dung DATABASE_URL Supabase, MP3 hoan tat o Supabase Storage.
 RUN mkdir -p /app/data /app/audio_files
 
 # Copy cau hinh supervisord
