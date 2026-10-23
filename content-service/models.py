@@ -1,10 +1,13 @@
-"""Model địa điểm, cache API cũ và bản thuyết minh lưu lâu dài.
 
-Có DATABASE_URL: dùng PostgreSQL Supabase (triển khai thật).
-Không có DATABASE_URL: dùng SQLite cho CRUD/test cũ.
+"""
+Model dia diem, cache API cu va ban thuyet minh luu lau dai.
+
+- Co DATABASE_URL: su dung PostgreSQL Supabase.
+- Khong co DATABASE_URL: su dung SQLite cho CRUD/test cu.
 """
 
 import os
+
 from sqlalchemy import (
     create_engine,
     Column,
@@ -20,151 +23,318 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+
+# ============================================================
+# 1. CAU HINH DATABASE
+# ============================================================
+
 DB_PATH = os.getenv("DB_PATH", "content.db")
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL") or (
-    f"sqlite:///{DB_PATH}" if os.path.isabs(DB_PATH) else f"sqlite:///./{DB_PATH}"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if SQLALCHEMY_DATABASE_URL.startswith("postgresql://"):
-    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+def normalize_database_url(url: str) -> str:
+    """
+    Chuan hoa URL PostgreSQL de dung voi SQLAlchemy va psycopg 3.
+
+    Cac dang duoc ho tro:
+    - postgresql://             -> postgresql+psycopg://
+    - postgres://               -> postgresql+psycopg://
+    - postgresqlpsycopg://      -> postgresql+psycopg://
+    - postgresql+psycopg://     -> giu nguyen
+    """
+
+    url = url.strip()
+
+    if url.startswith("postgresqlpsycopg://"):
+        url = url.replace(
+            "postgresqlpsycopg://",
+            "postgresql+psycopg://",
+            1,
+        )
+
+    elif url.startswith("postgres://"):
+        url = url.replace(
+            "postgres://",
+            "postgresql+psycopg://",
+            1,
+        )
+
+    elif url.startswith("postgresql://"):
+        url = url.replace(
+            "postgresql://",
+            "postgresql+psycopg://",
+            1,
+        )
+
+    # Cac dang PostgreSQL khac can duoc kiem tra ro rang,
+    # tranh de SQLAlchemy bao loi dialect kho hieu.
+    if url.startswith("postgresql+psycopg://"):
+        return url
+
+    if url.startswith("sqlite:"):
+        return url
+
+    raise ValueError(
+        "DATABASE_URL khong hop le. "
+        "Hay dung postgresql+psycopg://... cho PostgreSQL "
+        "hoac sqlite:///... cho SQLite."
+    )
+
+
+if DATABASE_URL and DATABASE_URL.strip():
+    SQLALCHEMY_DATABASE_URL = normalize_database_url(DATABASE_URL)
+else:
+    if os.path.isabs(DB_PATH):
+        SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"
+    else:
+        SQLALCHEMY_DATABASE_URL = f"sqlite:///./{DB_PATH}"
+
+
 IS_SQLITE = SQLALCHEMY_DATABASE_URL.startswith("sqlite:")
-engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True,
-    **({"connect_args": {"check_same_thread": False}} if IS_SQLITE else
-       {"pool_size": 3, "max_overflow": 2, "pool_timeout": 5,
-        "connect_args": {"connect_timeout": 5, "prepare_threshold": None}}))
 
+
+# ============================================================
+# 2. TAO DATABASE ENGINE
+# ============================================================
+
+if IS_SQLITE:
+    engine = create_engine(
+        SQLALCHEMY_DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={
+            "check_same_thread": False,
+        },
+    )
+else:
+    engine = create_engine(
+        SQLALCHEMY_DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=3,
+        max_overflow=2,
+        pool_timeout=5,
+        connect_args={
+            "connect_timeout": 5,
+            "prepare_threshold": None,
+        },
+    )
+
+
+# ============================================================
+# 3. BAT KIEM TRA KHOA NGOAI CHO SQLITE
+# ============================================================
 
 @event.listens_for(engine, "connect")
 def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
     """
-    SQLite MẶC ĐỊNH TẮT kiểm tra khóa ngoại (FOREIGN KEY) - phải bật bằng
-    PRAGMA cho TỪNG kết nối. Không bật thì narration_cache.location_id trỏ
-    tới location không tồn tại vẫn được ghi vào mà không báo lỗi.
+    SQLite mac dinh tat kiem tra khoa ngoai.
+    Bat FOREIGN KEY cho tung ket noi SQLite.
     """
+
     if not IS_SQLITE:
         return
+
     cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
 
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# ============================================================
+# 4. SESSION VA BASE
+# ============================================================
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+)
+
 Base = declarative_base()
 
 
+# ============================================================
+# 5. MODEL LOCATION
+# ============================================================
+
 class Location(Base):
     """
-    1 địa điểm. Có 2 "nguồn" (source):
-      - "manual": người dùng tự nhập (CRUD tuần 2) -> có thể thiếu GPS.
-      - "wikimedia": lấy từ Wikipedia qua /locations/discover -> luôn có
-        source_page_id, source_title, source_url, bắt buộc có GPS.
+    Mot dia diem.
+
+    source:
+    - manual: nguoi dung tu nhap.
+    - wikimedia: dia diem duoc lay tu Wikipedia.
+
+    Dia diem manual co the khong co GPS.
+    Dia diem Wikimedia can co GPS va metadata nguon.
     """
 
     __tablename__ = "locations"
 
     id = Column(Integer, primary_key=True, index=True)
+
     name = Column(String, nullable=False)
 
-    # Giữ lại để tương thích ngược với tuần 2 (translate-audio-service của B
-    # vẫn đang đọc field này).
+    # Giu tuong thich voi code cu.
     description_vi = Column(String, nullable=False)
     target_languages = Column(String, nullable=False)
 
-    # ----- Tuần 3: nội dung mô tả theo nguồn gốc -----
-    # Với record cũ (manual): description_source = description_vi (backfill).
-    # Với record Wikimedia: description_source = đoạn giới thiệu lấy từ bài viết.
+    # Noi dung mo ta goc theo nguon.
     description_source = Column(String, nullable=True)
 
-    # ----- Tuần 3: tọa độ + bán kính kích hoạt audio (mét) -----
+    # Toa do va ban kinh kich hoat audio.
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
-    radius = Column(Float, nullable=True)  # mét, mặc định 80
+    radius = Column(Float, nullable=True)
 
-    # ----- Tuần 3: metadata nguồn -----
-    source_lang = Column(String, nullable=True)  # vd: "vi"
-    source = Column(String, nullable=True)  # "manual" | "wikimedia"
-    source_title = Column(String, nullable=True)  # tiêu đề CHÍNH XÁC trên wiki
-    source_page_id = Column(Integer, nullable=True)  # pageid Wikipedia
+    # Thong tin nguon du lieu.
+    source_lang = Column(String, nullable=True)
+    source = Column(String, nullable=True)
+    source_title = Column(String, nullable=True)
+    source_page_id = Column(Integer, nullable=True)
     source_url = Column(String, nullable=True)
-    last_synced_at = Column(DateTime, nullable=True)  # lần cuối đồng bộ (UTC)
+
+    last_synced_at = Column(DateTime, nullable=True)
     is_ready = Column(Boolean, nullable=True, default=False)
 
     __table_args__ = (
-        # Chặn trùng: 1 bài Wikipedia (theo pageid + ngôn ngữ) chỉ được lưu
-        # 1 lần. Record manual có source_page_id = NULL nên không bị chặn
-        # bởi ràng buộc này (SQL coi NULL != NULL, nhiều NULL vẫn hợp lệ).
         UniqueConstraint(
-            "source", "source_lang", "source_page_id", name="ux_locations_source"
+            "source",
+            "source_lang",
+            "source_page_id",
+            name="ux_locations_source",
         ),
     )
 
 
+# ============================================================
+# 6. MODEL NARRATION CACHE
+# ============================================================
+
 class NarrationCache(Base):
     """
-    Kho cache nội dung thuyết minh cho 1 địa điểm theo 1 ngôn ngữ YÊU CẦU.
+    Cache ban thuyet minh theo dia diem va ngon ngu yeu cau.
 
-    - requested_lang: ngôn ngữ người dùng yêu cầu (vd "ja") - là phần của khóa.
-    - lang: ngôn ngữ THỰC TẾ của `text`. Khác requested_lang khi fallback
-      (không có bài tiếng Nhật -> dùng text tiếng Việt, is_fallback=True).
-    - audio_status: "text_ready" (mới có text) | "audio_ready" (đã có MP3).
-    - audio_filename: chỉ lưu TÊN FILE (basename .mp3), KHÔNG lưu URL/đường dẫn;
-      Gateway tự ghép thành /audio/<filename> khi trả cho client.
-    - expires_at: hết hạn thì coi như cache miss (mặc định 7 ngày).
-    Unique(location_id, requested_lang): mỗi địa điểm chỉ 1 dòng cho mỗi ngôn ngữ.
+    requested_lang:
+        Ngon ngu nguoi dung yeu cau.
+
+    lang:
+        Ngon ngu thuc te cua noi dung text.
+
+    audio_status:
+        text_ready: da co noi dung text.
+        audio_ready: da co file MP3.
+
+    audio_filename:
+        Chi luu ten file MP3, khong luu URL.
+
+    expires_at:
+        Thoi diem cache het han.
+
+    Moi dia diem chi co mot dong cache cho moi requested_lang.
     """
 
     __tablename__ = "narration_cache"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+
     location_id = Column(
         Integer,
         ForeignKey("locations.id", ondelete="CASCADE"),
         nullable=False,
     )
+
     requested_lang = Column(String, nullable=False)
     lang = Column(String, nullable=False)
+
     text = Column(Text, nullable=False)
     source_url = Column(String, nullable=True)
     target_title = Column(String, nullable=True)
+
     is_fallback = Column(Boolean, nullable=False, default=False)
     reason = Column(String, nullable=True)
+
     voice = Column(String, nullable=True)
     text_hash = Column(String, nullable=True)
     audio_filename = Column(String, nullable=True)
+
     audio_status = Column(String, nullable=False)
+
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
     expires_at = Column(DateTime, nullable=False)
 
     __table_args__ = (
         UniqueConstraint(
-            "location_id", "requested_lang", name="ux_narration_location_lang"
+            "location_id",
+            "requested_lang",
+            name="ux_narration_location_lang",
         ),
     )
 
 
+# ============================================================
+# 7. MODEL NARRATION
+# ============================================================
+
 class Narration(Base):
-    """Bản thuyết minh bền vững. Không có TTL; mỗi phiên bản là một dòng riêng."""
+    """
+    Ban thuyet minh luu lau dai.
+
+    Khong co TTL.
+    Moi phien ban noi dung la mot dong rieng.
+
+    location_snapshot:
+        JSON luu thong tin dia diem tai thoi diem tao ban thuyet minh.
+
+    storage_path:
+        Duong dan luu tru file audio, neu co.
+    """
+
     __tablename__ = "narrations"
+
     id = Column(String, primary_key=True)
-    location_id = Column(Integer, ForeignKey("locations.id", ondelete="RESTRICT"), nullable=False)
+
+    location_id = Column(
+        Integer,
+        ForeignKey("locations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
     language = Column(String, nullable=False)
     voice = Column(String, nullable=False)
     content_version = Column(String, nullable=False)
-    location_snapshot = Column(Text, nullable=False)  # JSON: tên, GPS, nguồn tại lúc tạo
-    source_text = Column(Text)
-    source_url = Column(Text)
-    final_text = Column(Text)
-    text_hash = Column(String)
-    audio_filename = Column(String)
-    storage_path = Column(String)
+
+    location_snapshot = Column(Text, nullable=False)
+
+    source_text = Column(Text, nullable=True)
+    source_url = Column(Text, nullable=True)
+    final_text = Column(Text, nullable=True)
+
+    text_hash = Column(String, nullable=True)
+    audio_filename = Column(String, nullable=True)
+    storage_path = Column(String, nullable=True)
+
     status = Column(String, nullable=False, default="pending")
+
     attempts = Column(Integer, nullable=False, default=0)
-    lease_token = Column(String)
-    lease_until = Column(DateTime)
-    retry_at = Column(DateTime)
-    error_code = Column(String)
+
+    lease_token = Column(String, nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    retry_at = Column(DateTime, nullable=True)
+
+    error_code = Column(String, nullable=True)
+
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
-    __table_args__ = (UniqueConstraint("location_id", "language", "voice", "content_version",
-                                       name="ux_narrations_version"),)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "location_id",
+            "language",
+            "voice",
+            "content_version",
+            name="ux_narrations_version",
+        ),
+    )
