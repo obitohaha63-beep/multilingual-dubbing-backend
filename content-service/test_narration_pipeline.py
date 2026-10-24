@@ -283,3 +283,39 @@ def test_cleaning_and_version_ignores_sync_time():
     key, _ = make_key(LOCATION, "vi", choose_voice("vi"))
     same, _ = make_key({**LOCATION, "last_synced_at": "2026", "is_ready": True}, "vi", choose_voice("vi"))
     assert key == same
+
+
+@pytest.mark.parametrize("status_code,expected_error", [
+    (400, "gemini_invalid_request"),
+    (401, "gemini_auth_error"),
+    (403, "gemini_auth_error"),
+    (404, "gemini_model_not_found"),
+    (429, "gemini_quota_exceeded"),
+    (500, "gemini_server_error"),
+    (503, "gemini_server_error"),
+])
+def test_gemini_http_error_codes(status_code, expected_error):
+    clients = NarrationClients()
+    clients.gemini_key = "test_key"
+
+    def respond(req):
+        return httpx.Response(status_code, json={"error": {"message": "Test error", "status": "FAILED"}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    with pytest.raises(PipelineError) as exc_info:
+        asyncio.run(clients.compose(client, "Nội dung kiểm tra địa điểm", "vi", job_id="test_job"))
+    assert exc_info.value.code == expected_error
+
+
+def test_gemini_timeout():
+    clients = NarrationClients()
+    clients.gemini_key = "test_key"
+
+    def respond(req):
+        raise httpx.ReadTimeout("Read timed out")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    with pytest.raises(PipelineError) as exc_info:
+        asyncio.run(clients.compose(client, "Nội dung kiểm tra địa điểm", "vi", job_id="test_job"))
+    assert exc_info.value.code == "gemini_timeout"
+

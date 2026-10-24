@@ -32,7 +32,7 @@ def choose_voice(language, voice=None):
 def make_key(location, language, voice):
     snapshot = json.dumps(location, ensure_ascii=False, sort_keys=True, default=str)
     config = [os.getenv("CONTENT_VERSION", "v1"), os.getenv("TTS_CONFIG_VERSION", "v1"),
-              os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), os.getenv("NARRATION_TARGET_CHARS", "900")]
+              os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"), os.getenv("NARRATION_TARGET_CHARS", "900")]
     # Không đưa is_ready/last_synced_at vào version: polling không tạo version mới.
     revision = {k: location.get(k) for k in ("name", "description_source", "latitude", "longitude",
                                            "source_lang", "source_page_id", "source_title", "source_url")}
@@ -118,7 +118,7 @@ class NarrationPipeline:
                 source, url = await self.clients.source(client, json.loads(row["location_snapshot"]))
                 await asyncio.to_thread(self.store.save, row, source_text=source, source_url=url)
             if not row["final_text"]:
-                text = await self.clients.compose(client, row["source_text"], row["language"])
+                text = await self.clients.compose(client, row["source_text"], row["language"], job_id=row["id"])
                 await asyncio.to_thread(self.store.save, row, final_text=text,
                     text_hash=hashlib.sha256(text.encode()).hexdigest())
             path = row["storage_path"] or f"{row['id']}/{row['text_hash']}.mp3"

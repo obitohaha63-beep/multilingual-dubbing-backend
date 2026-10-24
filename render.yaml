@@ -3,7 +3,7 @@ services:
     type: web
     runtime: docker
     repo: https://github.com/obitohaha63-beep/multilingual-dubbing-backend
-    branch: main
+    branch: cong-thanh
     dockerfilePath: ./render.Dockerfile
     # Render build tu root cua repo, context la thu muc goc
     dockerContext: .
