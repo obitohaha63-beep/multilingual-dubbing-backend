@@ -52,7 +52,7 @@ class NarrationClients:
         self.secret = os.getenv("SUPABASE_SECRET_KEY", "")
         self.bucket = os.getenv("SUPABASE_AUDIO_BUCKET", "narration-audio")
         self.gemini_key = os.getenv("GEMINI_API_KEY", "")
-        self.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
         self.target_chars = int(os.getenv("NARRATION_TARGET_CHARS", "900"))
         if not 100 <= self.target_chars <= 1200:
             raise PipelineError("invalid_target_chars")
