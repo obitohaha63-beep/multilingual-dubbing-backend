@@ -54,6 +54,23 @@ ENV TTS_SERVICE_URL=http://127.0.0.1:8002
 ENV DB_PATH=/app/data/content.db
 ENV AUDIO_DIR=/app/audio_files
 
+# Cac bien moi truong mac dinh (tranh loi supervisord status 2 neu chua duoc set tren Render)
+ENV WIKIMEDIA_USER_AGENT="multilingual-dubbing/1.0 (contact@example.com)"
+ENV NARRATION_TTL_DAYS="7"
+ENV TTS_PROVIDER_VI="google"
+ENV GOOGLE_TTS_API_KEY=""
+ENV TTS_TIMEOUT_SECONDS="25.0"
+ENV TTS_CONFIG_VERSION="v1"
+ENV TTS_VOICE_VI="vi-VN-HoaiMyNeural"
+ENV TTS_VOICE_EN="en-US-JennyNeural"
+ENV TTS_VOICE_JA="ja-JP-NanamiNeural"
+ENV GATEWAY_TIMEOUT="6.0"
+ENV GATEWAY_NARRATE_TIMEOUT="30.0"
+ENV ADMIN_PATH="/admin-dashboard/"
+ENV ADMIN_USERNAME="admin"
+ENV ADMIN_PASSWORD=""
+ENV ADMIN_SESSION_SECRET=""
+
 # Mo cong chinh ma Render se expose
 EXPOSE 8000
 
