@@ -95,7 +95,10 @@ def setup_pipeline(tmp_path, monkeypatch):
     store = NarrationStore(sessions)
     apis = MockAPIs()
     original = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(apis.respond), **kw))
+    def client_factory(**kwargs):
+        kwargs.setdefault("transport", httpx.MockTransport(apis.respond))
+        return original(**kwargs)
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
     pipeline = NarrationPipeline(store, NarrationClients())
     yield pipeline, store, apis, sessions
     engine.dispose()
@@ -419,5 +422,82 @@ def test_tts_terminal_response_not_retried():
             with pytest.raises(PipelineError, match="tts_no_audio"):
                 await clients.speech(client, {"final_text": TEXT, "language": "vi", "voice": choose_voice("vi")})
         assert len(calls) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fallback_works", [True, False])
+def test_narrate_through_real_tts_endpoint(setup_pipeline, tmp_path, monkeypatch, fallback_works):
+    """Real Content/Translate ASGI routes, real MP3 parser/database; only providers are mocked."""
+    import base64
+    import importlib.util
+    import sys
+    from unittest.mock import AsyncMock
+    from pathlib import Path
+    import main as content_app
+    pipeline, _, apis, sessions = setup_pipeline
+    root = Path(__file__).resolve().parents[1]
+    audio_dir = tmp_path / "edge-audio"
+    audio_dir.mkdir()
+    monkeypatch.setenv("AUDIO_DIR", str(audio_dir))
+    monkeypatch.syspath_prepend(str(root / "translate-audio-service"))
+    import tts
+    monkeypatch.setattr(tts, "AUDIO_DIR", audio_dir)
+    monkeypatch.setattr(tts, "available_voice_names", AsyncMock(return_value=set(tts.VI_VOICES)))
+    spec = importlib.util.spec_from_file_location("edge_integration_app", root / "translate-audio-service/main.py")
+    edge_app = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, edge_app)
+    spec.loader.exec_module(edge_app)
+    mp3 = base64.b64decode((root / "translate-audio-service/tests/fixtures/short-mp3.b64").read_text())
+    voices = []
+    class Communicate:
+        def __init__(self, text, voice):
+            assert text == TEXT
+            self.voice = voice
+            voices.append(voice)
+        async def save(self, filename):
+            if not fallback_works or self.voice == tts.VI_VOICES[0]:
+                raise tts.edge_tts.exceptions.NoAudioReceived("upstream no audio")
+            Path(filename).write_bytes(mp3)
+    monkeypatch.setattr(tts.edge_tts, "Communicate", Communicate)
+    monkeypatch.setattr(content_app, "IS_SQLITE", False)
+    monkeypatch.setattr(content_app, "SessionLocal", sessions)
+    monkeypatch.setattr(content_app, "narration_pipeline", pipeline)
+
+    async def run():
+        edge_transport = httpx.ASGITransport(app=edge_app.app)
+        async def upstream(request):
+            if request.url.host == "tts":
+                return await edge_transport.handle_async_request(request)
+            return apis.respond(request)
+        pipeline.http = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=content_app.app), base_url="http://content") as client:
+            body = {"location_id": 1, "target_lang": "vi"}
+            response = await client.post("/narrate", json=body)
+            assert response.status_code == 202
+            await asyncio.gather(*list(pipeline.tasks))
+            response = await client.post("/narrate", json=body)
+            row = read_row(sessions)
+            assert row.final_text == TEXT and apis.calls["gemini"] == 1
+            if fallback_works:
+                assert response.status_code == 200
+                assert response.json()["voice"] == tts.VI_VOICES[1]
+                assert response.json()["requested_voice"] == tts.VI_VOICES[0]
+                assert apis.objects[row.storage_path] == mp3
+                assert voices == list(tts.VI_VOICES)
+                # A new coordinator recovers the actual voice from durable metadata.
+                restarted = NarrationPipeline(NarrationStore(sessions), NarrationClients())
+                restarted.http = pipeline.http
+                monkeypatch.setattr(content_app, "narration_pipeline", restarted)
+                cached = await client.post("/narrate", json=body)
+                assert cached.status_code == 200 and cached.json()["cache_hit"]
+                assert cached.json()["voice"] == tts.VI_VOICES[1]
+                assert voices == list(tts.VI_VOICES) and apis.calls["gemini"] == 1
+            else:
+                assert response.status_code == 503 and response.json()["reason"] == "tts_no_audio"
+                assert voices == [tts.VI_VOICES[0], tts.VI_VOICES[1], tts.VI_VOICES[1]]
+                assert row.status == "failed" and not apis.objects
+                await client.post("/narrate", json=body)
+                assert len(voices) == 3 and apis.calls["gemini"] == 1
+        await pipeline.close()
     asyncio.run(run())
 

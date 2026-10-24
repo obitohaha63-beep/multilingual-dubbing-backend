@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field
 
 import tts
 import wikimedia_client
@@ -139,6 +139,9 @@ class TextToSpeechResponse(BaseModel):
     audio_filename: str
     audio_url: str
     cache_hit: bool
+    requested_voice: Optional[str] = None
+    voice_fallback: bool = False
+    attempts: list[dict] = Field(default_factory=list)
 
 
 # Legacy (Tuan 2) — giu lai de tuong thich, KHONG dung trong core flow.
@@ -435,6 +438,10 @@ async def text_to_speech(req: TextToSpeechRequest):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=503, content={"detail": {
+            "code": "tts_unavailable", "message": "Hàng đợi TTS đang bận, vui lòng thử lại sau",
+            "cause": "QueueTimeout", "retryable": True, "attempts": []}})
     except (tts.TTSError, tts.TTSTimeoutError) as exc:
         return JSONResponse(
             status_code=503,
@@ -444,6 +451,7 @@ async def text_to_speech(req: TextToSpeechRequest):
                     "message": str(exc),
                     "cause": exc.cause,
                     "retryable": exc.retryable,
+                    "attempts": exc.attempts,
                 }
             },
         )
@@ -453,7 +461,9 @@ async def text_to_speech(req: TextToSpeechRequest):
             content={
                 "detail": {
                     "code": "tts_unavailable",
-                    "message": f"Dịch vụ TTS gặp sự cố nội bộ: {str(exc)}",
+                    "message": "Dịch vụ TTS gặp sự cố nội bộ",
+                    "cause": type(exc).__name__,
+                    "retryable": False,
                 }
             },
         )

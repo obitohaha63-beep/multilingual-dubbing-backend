@@ -331,9 +331,13 @@ class NarrationClients:
             if not re.fullmatch(r"[a-f0-9]{64}\.mp3", filename):
                 raise PipelineError("tts_invalid_response")
             expected = hashlib.sha256(row["final_text"].encode()).hexdigest()
-            if data["voice"] != row["voice"] or data["text_hash"] != expected:
+            allowed_voices = {row["voice"]}
+            if row["language"] == "vi":
+                allowed_voices.update({"vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"})
+            if (data["voice"] not in allowed_voices or data["text_hash"] != expected
+                    or data.get("requested_voice", row["voice"]) != row["voice"]):
                 raise PipelineError("tts_text_mismatch")
-            return filename
+            return {"audio_filename": filename, "voice": data["voice"]}
         except (ValueError, KeyError, TypeError) as exc:
             raise PipelineError("tts_invalid_response") from exc
 

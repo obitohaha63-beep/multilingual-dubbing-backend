@@ -46,6 +46,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import base64
+from pathlib import Path
+
+MP3_BYTES = base64.b64decode((Path(__file__).parent / "fixtures" / "short-mp3.b64").read_text())
+
+@pytest.fixture(autouse=True)
+def mock_voice_catalog(monkeypatch):
+    async def names():
+        return set(tts.VI_VOICES)
+    monkeypatch.setattr("tts.available_voice_names", names)
+
 from fastapi.testclient import TestClient
 
 from main import app, MAX_CHARS, CONTENT_SERVICE_URL
@@ -563,7 +574,7 @@ class MockEdgeCommunicate:
 
     async def save(self, filepath: str):
         with open(filepath, "wb") as f:
-            f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_AUDIO_PAYLOAD")
+            f.write(MP3_BYTES)
 
 
 def test_tts_create_mp3_success(tmp_path, monkeypatch):
@@ -609,7 +620,7 @@ def test_tts_cache_hit_second_request(tmp_path, monkeypatch):
             nonlocal call_count
             call_count += 1
             with open(filepath, "wb") as f:
-                f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_AUDIO_PAYLOAD")
+                f.write(MP3_BYTES)
 
     monkeypatch.setattr("edge_tts.Communicate", CountingMockCommunicate)
 
@@ -646,7 +657,7 @@ def test_tts_file_lost_regenerates_no_fake_cache_hit(tmp_path, monkeypatch):
             nonlocal call_count
             call_count += 1
             with open(filepath, "wb") as f:
-                f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_AUDIO_PAYLOAD")
+                f.write(MP3_BYTES)
 
     monkeypatch.setattr("edge_tts.Communicate", CountingMockCommunicate)
 
@@ -695,7 +706,7 @@ async def test_tts_concurrent_requests_same_key(tmp_path, monkeypatch):
             # Delay nhẹ để mô phỏng thời gian mạng
             await asyncio.sleep(0.05)
             with open(filepath, "wb") as f:
-                f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_AUDIO_PAYLOAD")
+                f.write(MP3_BYTES)
 
     monkeypatch.setattr("edge_tts.Communicate", SlowMockCommunicate)
 
@@ -825,7 +836,7 @@ def test_audio_static_serving(tmp_path, monkeypatch):
     monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
     tts.ensure_audio_dir(tmp_path)
 
-    test_content = b"ID3\x03REAL_VERIFIED_AUDIO_CONTENT"
+    test_content = MP3_BYTES
 
     class CustomMockCommunicate:
         def __init__(self, text: str, voice: str):
@@ -954,7 +965,7 @@ def test_tts_retries_on_no_audio_received_and_succeeds(tmp_path, monkeypatch):
             if attempts == 1:
                 raise edge_tts.exceptions.NoAudioReceived("No audio received from Edge TTS")
             with open(filepath, "wb") as f:
-                f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_PAYLOAD")
+                f.write(MP3_BYTES)
 
     monkeypatch.setattr("edge_tts.Communicate", RetryMockCommunicate)
 
@@ -965,6 +976,9 @@ def test_tts_retries_on_no_audio_received_and_succeeds(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert attempts == 2
     data = resp.json()
+    assert data["voice"] == "vi-VN-NamMinhNeural"
+    assert data["requested_voice"] == "vi-VN-HoaiMyNeural"
+    assert [a["voice"] for a in data["attempts"]] == list(tts.VI_VOICES)
     assert data["cache_hit"] is False
     audio_path = tmp_path / data["audio_filename"]
     assert audio_path.is_file()
@@ -1003,6 +1017,7 @@ def test_tts_retries_exhausted_returns_503(tmp_path, monkeypatch):
     assert "NoAudioReceived" in data["detail"]["message"]
     assert data["detail"]["cause"] == "NoAudioReceived"
     assert data["detail"]["retryable"] is False
+    assert [a["voice"] for a in data["detail"]["attempts"]] == [tts.VI_VOICES[0], tts.VI_VOICES[1], tts.VI_VOICES[1]]
 
 
 def test_tts_fixed_provider_error_is_not_retried(tmp_path, monkeypatch):
@@ -1023,4 +1038,115 @@ def test_tts_fixed_provider_error_is_not_retried(tmp_path, monkeypatch):
     assert response.status_code == 503
     assert attempts == 1
     assert response.json()["detail"]["retryable"] is False
+
+
+@pytest.mark.parametrize("preferred", tts.VI_VOICES)
+def test_vi_preference_and_fallback_cached_across_requests(tmp_path, monkeypatch, preferred):
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    monkeypatch.setenv("TTS_VOICE_VI", preferred)
+    seen = []
+    text = "Xin chào, Việt Nam! Giữ nguyên dấu: ă, â, ê, ô, ơ, ư, đ."
+    class Communicate:
+        def __init__(self, value, voice):
+            assert value == text
+            self.voice = voice
+            seen.append(voice)
+        async def save(self, filename):
+            if self.voice == preferred:
+                raise tts.edge_tts.exceptions.NoAudioReceived("no audio")
+            Path(filename).write_bytes(MP3_BYTES)
+    monkeypatch.setattr(tts.edge_tts, "Communicate", Communicate)
+    body = {"text": text, "lang": "vi"}
+    first = client.post("/text-to-speech", json=body)
+    assert first.status_code == 200
+    alternate = next(v for v in tts.VI_VOICES if v != preferred)
+    assert seen == [preferred, alternate]
+    assert first.json()["voice"] == alternate and first.json()["voice_fallback"]
+    assert first.json()["audio_filename"] == tts.compute_cache_key(text, "vi", alternate) + ".mp3"
+    second = client.post("/text-to-speech", json=body)
+    assert second.status_code == 200 and second.json()["cache_hit"]
+    assert seen == [preferred, alternate]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("text", ["", " \t\n", "Tiếng Việt\x00", "Tiếng Việt\x01", "\u200b"])
+def test_invalid_text_never_reaches_edge(monkeypatch, text):
+    mock = MagicMock()
+    monkeypatch.setattr(tts.edge_tts, "Communicate", mock)
+    assert client.post("/text-to-speech", json={"text": text, "lang": "vi"}).status_code == 422
+    mock.assert_not_called()
+
+
+@pytest.mark.parametrize("audio", [b"", b"ID3" + bytes(512), b"not mp3" * 100])
+def test_invalid_mp3_is_not_published(tmp_path, monkeypatch, audio):
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    class Communicate:
+        def __init__(self, text, voice):
+            pass
+        async def save(self, filename):
+            Path(filename).write_bytes(audio)
+    monkeypatch.setattr(tts.edge_tts, "Communicate", Communicate)
+    response = client.post("/text-to-speech", json={"text": "Văn bản hợp lệ.", "lang": "vi"})
+    assert response.status_code == 503
+    assert response.json()["detail"]["cause"] == "InvalidMP3"
+    assert not list(tmp_path.iterdir())
+
+
+def test_catalog_missing_voice_uses_listed_vi_voice(tmp_path, monkeypatch):
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    monkeypatch.setattr(tts, "available_voice_names", AsyncMock(return_value={tts.VI_VOICES[1]}))
+    monkeypatch.setattr(tts.edge_tts, "Communicate", MockEdgeCommunicate)
+    response = client.post("/text-to-speech", json={"text": "Văn bản hợp lệ.", "lang": "vi"})
+    assert response.status_code == 200 and response.json()["voice"] == tts.VI_VOICES[1]
+
+
+def test_catalog_outage_does_not_prevent_synthesis(tmp_path, monkeypatch):
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    monkeypatch.setattr(tts, "available_voice_names", AsyncMock(return_value=None))
+    monkeypatch.setattr(tts.edge_tts, "Communicate", MockEdgeCommunicate)
+    assert client.post("/text-to-speech", json={"text": "Văn bản hợp lệ.", "lang": "vi"}).status_code == 200
+
+
+@pytest.mark.parametrize("exc,category,status,retryable", [
+    (asyncio.TimeoutError(), "timeout", None, True),
+    (ConnectionError(), "network", None, True),
+    (tts.edge_tts.exceptions.WebSocketError("private signed URL"), "websocket", None, True),
+    (tts.WSServerHandshakeError(MagicMock(), (), status=403), "websocket", 403, False),
+    (tts.ClientResponseError(MagicMock(), (), status=503), "http", 503, True),
+    (tts.edge_tts.exceptions.NoAudioReceived(), "no_audio", None, True),
+])
+def test_transport_error_categories(exc, category, status, retryable):
+    assert tts.classify_error(exc) == (category, status, retryable)
+
+
+def test_websocket_error_does_not_log_signed_url(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    class Communicate:
+        def __init__(self, text, voice):
+            pass
+        async def save(self, filename):
+            Path(filename).write_bytes(b"partial audio")
+            raise tts.WSServerHandshakeError(MagicMock(), (), status=403, message="secret-token-in-url")
+    monkeypatch.setattr(tts.edge_tts, "Communicate", Communicate)
+    response = client.post("/text-to-speech", json={"text": "Văn bản hợp lệ.", "lang": "vi"})
+    assert response.status_code == 503
+    assert len(response.json()["detail"]["attempts"]) == 1
+    assert response.json()["detail"]["attempts"][0]["http_status"] == 403
+    assert "secret-token-in-url" not in caplog.text and "secret-token-in-url" not in response.text
+    assert not list(tmp_path.iterdir())
+
+
+def test_queue_timeout_is_transient_and_never_starts_edge(monkeypatch):
+    import main
+    slots = MagicMock()
+    slots.acquire = AsyncMock(side_effect=asyncio.TimeoutError())
+    monkeypatch.setattr(main, "_tts_slots", slots)
+    communicate = MagicMock()
+    monkeypatch.setattr(tts.edge_tts, "Communicate", communicate)
+    response = client.post("/text-to-speech", json={"text": "Văn bản hợp lệ.", "lang": "vi"})
+    assert response.status_code == 503
+    assert response.json()["detail"]["cause"] == "QueueTimeout"
+    assert response.json()["detail"]["retryable"] is True
+    communicate.assert_not_called()
+    slots.release.assert_not_called()
 

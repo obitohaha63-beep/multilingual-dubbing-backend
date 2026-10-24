@@ -92,8 +92,10 @@ class NarrationPipeline:
                 "reason": row["error_code"], "retry_after": 10, "cache_hit": False}
 
     async def ready_response(self, client, row):
+        actual_voice = json.loads(row["location_snapshot"]).get("_tts", {}).get("voice", row["voice"])
         return {"requested_lang": row["language"], "lang": row["language"],
-                "translated_text": row["final_text"], "voice": row["voice"],
+                "translated_text": row["final_text"], "voice": actual_voice,
+                "requested_voice": row["voice"], "voice_fallback": actual_voice != row["voice"],
                 "audio_url": await self.clients.audio_url(client, row["storage_path"]),
                 "source_url": row["source_url"], "text_hash": row["text_hash"],
                 "content_version": row["content_version"], "is_fallback": False,
@@ -135,8 +137,14 @@ class NarrationPipeline:
                     if response.status_code != 200 or not response.json().get("exists"):
                         filename = None
                 if not filename:
-                    filename = await self.clients.speech(client, row)
-                    await asyncio.to_thread(self.store.save, row, audio_filename=filename)
+                    speech = await self.clients.speech(client, row)
+                    filename = speech["audio_filename"]
+                    snapshot = json.loads(row["location_snapshot"])
+                    # Preserve the requested voice in the unique cache key. Persist the actual
+                    # voice in existing JSON metadata so fallback survives restart, no migration.
+                    snapshot["_tts"] = {"voice": speech["voice"], "requested_voice": row["voice"]}
+                    await asyncio.to_thread(self.store.save, row, audio_filename=filename,
+                        location_snapshot=json.dumps(snapshot, ensure_ascii=False))
                 await self.clients.upload(client, filename, path)
             # Storage đã xác nhận file tồn tại, chỉ lúc này mới ready.
             await asyncio.to_thread(self.store.save, row, status="ready", error_code=None,
