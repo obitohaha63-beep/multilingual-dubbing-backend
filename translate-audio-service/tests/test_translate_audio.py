@@ -56,6 +56,8 @@ def mock_voice_catalog(monkeypatch):
     async def names():
         return set(tts.VI_VOICES)
     monkeypatch.setattr("tts.available_voice_names", names)
+    monkeypatch.setenv("TTS_PROVIDER_VI", "edge")
+    monkeypatch.setenv("DISABLE_GTTS_FALLBACK", "1")
 
 from fastapi.testclient import TestClient
 

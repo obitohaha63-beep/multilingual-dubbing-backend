@@ -439,6 +439,8 @@ def test_narrate_through_real_tts_endpoint(setup_pipeline, tmp_path, monkeypatch
     audio_dir = tmp_path / "edge-audio"
     audio_dir.mkdir()
     monkeypatch.setenv("AUDIO_DIR", str(audio_dir))
+    monkeypatch.setenv("TTS_PROVIDER_VI", "edge")
+    monkeypatch.setenv("DISABLE_GTTS_FALLBACK", "1")
     monkeypatch.syspath_prepend(str(root / "translate-audio-service"))
     import tts
     monkeypatch.setattr(tts, "AUDIO_DIR", audio_dir)

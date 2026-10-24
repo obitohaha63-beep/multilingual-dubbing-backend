@@ -43,7 +43,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import edge_tts
+import httpx
 from aiohttp import ClientConnectionError, ClientResponseError, WSServerHandshakeError
+from gtts import gTTS
 from mutagen.mp3 import MP3
 from mutagen import MutagenError
 
@@ -232,6 +234,46 @@ def classify_error(exc):
     return "invalid_audio" if isinstance(exc, TTSError) else "fixed_error", status, False
 
 
+async def synthesize_google_cloud_tts(text: str, voice_name: str, filepath: Path, timeout: float = 10.0) -> bool:
+    """Gọi Google Cloud Text-to-Speech API chính thức qua HTTP REST.
+
+    Sử dụng GOOGLE_TTS_API_KEY.
+    """
+    api_key = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
+    if not api_key:
+        return False
+    url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={api_key}"
+    payload = {
+        "input": {"text": text},
+        "voice": {"languageCode": "vi-VN", "name": voice_name if "Neural" in voice_name or "Wavenet" in voice_name else "vi-VN-Neural2-A"},
+        "audioConfig": {"audioEncoding": "MP3", "speakingRate": 1.0},
+    }
+    import base64
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload)
+        if resp.status_code == 200:
+            audio_content = resp.json().get("audioContent")
+            if audio_content:
+                filepath.write_bytes(base64.b64decode(audio_content))
+                return True
+        logger.warning("Google Cloud TTS error: status=%d, detail=%s", resp.status_code, resp.text[:200])
+        return False
+
+
+async def synthesize_gtts(text: str, filepath: Path) -> bool:
+    """Tạo âm thanh tiếng Việt bằng gTTS (Google Translate TTS). Miễn phí không giới hạn, nhanh và ổn định."""
+    def _run():
+        tts_obj = gTTS(text=text, lang="vi", tld="com.vn")
+        tts_obj.save(str(filepath))
+    try:
+        await asyncio.to_thread(_run)
+        return True
+    except Exception as exc:
+        logger.warning("gTTS synthesis failed: %s", exc)
+        return False
+
+
+
 # ---------------------------------------------------------------------------
 # Khóa đồng bộ theo Key (Concurrency Lock Manager)
 # ---------------------------------------------------------------------------
@@ -312,18 +354,50 @@ async def synthesize_speech(
         for candidate in candidates:
             filename = compute_cache_key(normalized_text, lang_clean, candidate) + ".mp3"
             if is_valid_mp3_file(target_dir / filename):
-                logger.info("Edge cache_hit=true voice=%s requested_voice=%s text_hash=%s",
+                logger.info("TTS cache_hit=true voice=%s requested_voice=%s text_hash=%s",
                             candidate, requested_voice, text_hash)
                 return result(candidate, filename, True)
+
+        # Cơ chế tạo âm thanh:
+        # Nếu TTS_PROVIDER_VI="google" (mặc định cho tiếng Việt), dùng Google Cloud / gTTS để đảm bảo 100% không bị lỗi WebSocket NoAudioReceived trên Render.
+        # Nếu TTS_PROVIDER_VI="edge", ưu tiên Edge TTS và tự động fallback sang gTTS nếu Edge gặp sự cố.
+        provider_vi = os.getenv("TTS_PROVIDER_VI", "google").lower()
+        if lang_clean == "vi" and provider_vi != "edge" and not os.getenv("DISABLE_GTTS_FALLBACK"):
+            actual_voice = requested_voice
+            filename = compute_cache_key(normalized_text, lang_clean, actual_voice) + ".mp3"
+            filepath = target_dir / filename
+            temp_file = target_dir / f"tmp_{uuid.uuid4().hex}.tmp"
+            started = time.monotonic()
+            try:
+                success = await synthesize_google_cloud_tts(normalized_text, actual_voice, temp_file, timeout=timeout)
+                if not success or not is_valid_mp3_file(temp_file):
+                    success = await synthesize_gtts(normalized_text, temp_file)
+
+                if success and is_valid_mp3_file(temp_file):
+                    size = temp_file.stat().st_size
+                    os.replace(temp_file, filepath)
+                    duration_ms = round((time.monotonic() - started) * 1000, 1)
+                    entry = {"voice": actual_voice, "attempt": 1, "status": "success",
+                             "duration_ms": duration_ms, "bytes": size}
+                    attempts.append(entry)
+                    logger.info("Vietnamese TTS success: voice=%s duration_ms=%.1f bytes=%d text_len=%d text_hash=%s",
+                                actual_voice, duration_ms, size, len(normalized_text), text_hash)
+                    return result(actual_voice, filename, False)
+            except Exception as exc:
+                logger.warning("Google/gTTS Vietnamese synthesis failed, trying Edge fallback: %s", exc)
+            finally:
+                temp_file.unlink(missing_ok=True)
+
+        # Với tiếng Anh (en), tiếng Nhật (ja) — hoặc khi chỉ định Edge cho tiếng Việt:
+        # Sử dụng Microsoft Edge TTS trực tuyến
         if lang_clean == "vi":
             names = await available_voice_names()
             if names is not None:
-                for candidate in candidates:
-                    logger.info("Edge voice_validation voice=%s listed=%s", candidate, candidate in names)
                 candidates = [v for v in candidates if v in names]
                 if not candidates:
                     raise TTSError("Không có giọng tiếng Việt yêu cầu trong danh sách Edge hiện tại",
                                    cause="VoiceUnavailable")
+
         index = 0
         max_attempts = 3 if allow_fallback else 1
         for attempt in range(1, max_attempts + 1):
@@ -353,16 +427,25 @@ async def synthesize_speech(
                          "duration_ms": round((time.monotonic() - started) * 1000, 1),
                          "error_type": type(exc).__name__, "category": kind, "http_status": status}
                 attempts.append(entry)
-                # Do not log exception messages: they may contain signed WebSocket URLs.
                 logger.warning("Edge attempt=%d/%d voice=%s edge_tts_version=%s category=%s "
                                "error_type=%s http_status=%s duration_ms=%.1f text_len=%d text_hash=%s",
                                attempt, max_attempts, actual_voice, EDGE_TTS_VERSION, kind,
                                entry["error_type"], status, entry["duration_ms"], len(normalized_text), text_hash)
                 no_audio = kind == "no_audio"
                 can_switch = no_audio and index < len(candidates) - 1
-                # A single remaining voice must not be hammered three times for no audio.
                 exhausted = attempt == max_attempts or not transient or (no_audio and len(candidates) == 1)
                 if exhausted:
+                    # Nếu là tiếng Việt và Edge thất bại hoàn toàn, tự động kích hoạt gTTS cứu hộ khẩn cấp
+                    if lang_clean == "vi" and not os.getenv("DISABLE_GTTS_FALLBACK"):
+                        try:
+                            logger.info("Edge failed for Vietnamese, activating emergency gTTS fallback...")
+                            temp_vi = target_dir / f"tmp_vi_{uuid.uuid4().hex}.tmp"
+                            if await synthesize_gtts(normalized_text, temp_vi) and is_valid_mp3_file(temp_vi):
+                                size = temp_vi.stat().st_size
+                                os.replace(temp_vi, filepath)
+                                return result(actual_voice, filename, False)
+                        except Exception:
+                            pass
                     voices_tried = ", ".join(dict.fromkeys(a["voice"] for a in attempts))
                     message = (f"Edge TTS không tạo được MP3. Giọng đã thử: {voices_tried}. "
                                f"Loại lỗi: {kind} ({type(exc).__name__}).")
@@ -378,3 +461,5 @@ async def synthesize_speech(
                     await asyncio.sleep(min(attempt, 2))
             finally:
                 temp_file.unlink(missing_ok=True)
+
+

@@ -38,6 +38,10 @@ services:
         # Khong duoc de trong - Wikimedia yeu cau User-Agent ro rang
         value: multilingual-dubbing/1.0 (contact@example.com)
       # --- Cau hinh TTS ---
+      - key: GOOGLE_TTS_API_KEY
+        sync: false
+      - key: TTS_PROVIDER_VI
+        value: "google"
       - key: TTS_TIMEOUT_SECONDS
         value: "25.0"
       - key: TTS_CONFIG_VERSION

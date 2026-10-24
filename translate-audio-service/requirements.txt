@@ -5,3 +5,4 @@ httpx
 pydantic
 edge-tts==7.3.1
 mutagen>=1.47,<2
+gTTS>=2.5.0
