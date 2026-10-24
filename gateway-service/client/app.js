@@ -61,9 +61,11 @@ class TourStateManager {
     this.lastSentFix = null;          // { latitude, longitude, timestamp }
     this.lastRequestTime = 0;
     this.isRequestInFlight = false;
+    this.generationPending = false;
   }
 
   resetAll() {
+    this.generationPending = false;
     this.activeLocationId = null;
     this.activeLocationCoords = null;
     this.playedKeys.clear();
@@ -78,6 +80,7 @@ class TourStateManager {
   setLanguage(newLang) {
     if (this.currentLang !== newLang) {
       this.currentLang = newLang;
+      this.generationPending = false;
       // Tăng sequence token để bỏ qua các response đang bay về bằng ngôn ngữ cũ
       this.sequenceToken++;
       return true;
@@ -172,7 +175,7 @@ class TourStateManager {
     );
     const timeSinceLastSent = now - this.lastSentFix.timestamp;
 
-    return dist >= 20 || timeSinceLastSent >= 10000;
+    return dist >= 20 || timeSinceLastSent >= (this.generationPending ? 3000 : 10000);
   }
 
   prepareRequest(now = Date.now()) {
@@ -239,7 +242,8 @@ class TourStateManager {
     }
 
     // 4. Kiểm tra playedKeys cho cặp (location_id, requested_lang)
-    if (["pending", "processing"].includes(response.narration_status)) {
+    this.generationPending = ["pending", "processing"].includes(response.narration_status);
+    if (this.generationPending) {
       return { action: "wait_generation", switchedLocation, data: response };
     }
     if (response.narration_status === "error") {
@@ -361,6 +365,10 @@ class TourStateManager {
 
   // DOM Elements
   const langSelect = document.getElementById("lang-select");
+  const ui = window.GuideI18n.bind(document);
+  const t = ui.t;
+  ui.apply(langSelect.value);
+  let lastCandidates = [];
   const btnStart = document.getElementById("btn-start");
   const btnStop = document.getElementById("btn-stop");
   const gpsStatus = document.getElementById("gps-status");
@@ -397,21 +405,21 @@ class TourStateManager {
   // UI Helpers
   function setGpsStatus(text, badgeClass) {
     if (gpsStatus) {
-      gpsStatus.textContent = text;
+      ui.setText(gpsStatus, text);
       gpsStatus.className = `status-value badge ${badgeClass}`;
     }
   }
 
   function setApiStatus(text, badgeClass) {
     if (apiStatus) {
-      apiStatus.textContent = text;
+      ui.setText(apiStatus, text);
       apiStatus.className = `status-value badge ${badgeClass}`;
     }
   }
 
   function setPlayerStatus(text, badgeClass) {
     if (playerStatusBadge) {
-      playerStatusBadge.textContent = text;
+      ui.setText(playerStatusBadge, text);
       playerStatusBadge.className = `status-value badge ${badgeClass}`;
     }
   }
@@ -425,7 +433,7 @@ class TourStateManager {
   }
 
   function showRetryBanner(msg) {
-    if (audioErrorMsg) audioErrorMsg.textContent = msg || "Không thể phát âm thanh.";
+    if (audioErrorMsg) ui.setText(audioErrorMsg, msg || "Không thể phát âm thanh.");
     if (audioRetryBanner) audioRetryBanner.classList.remove("hidden");
   }
 
@@ -498,7 +506,7 @@ class TourStateManager {
     if (!("speechSynthesis" in window)) {
       manager.markPlaybackError("browser_speech_not_supported");
       setPlayerStatus("Trình duyệt không hỗ trợ Web Speech", "badge-danger");
-      if (playerSource) playerSource.textContent = "Không hỗ trợ Web Speech API";
+      if (playerSource) ui.setText(playerSource, "Không hỗ trợ Web Speech API");
       showRetryBanner("Trình duyệt không hỗ trợ Web Speech API.");
       return;
     }
@@ -507,7 +515,7 @@ class TourStateManager {
     const voice = findMatchingVoice(lang);
     if (!voice) {
       manager.markPlaybackError("no_browser_voice_found");
-      if (playerSource) playerSource.textContent = "Chỉ hiển thị văn bản (Chưa có gói giọng đọc)";
+      if (playerSource) ui.setText(playerSource, "Chỉ hiển thị văn bản (Chưa có gói giọng đọc)");
       setPlayerStatus("Không có voice phù hợp trong trình duyệt", "badge-warning");
       showRetryBanner(`Trình duyệt không có gói giọng đọc cho ngôn ngữ '${lang}'. Bạn vẫn có thể đọc bài bên trên.`);
       if (btnAudioStop) btnAudioStop.disabled = true;
@@ -515,7 +523,7 @@ class TourStateManager {
     }
 
     if (playerSource) {
-      playerSource.textContent = `Giọng đọc trình duyệt (${voice.name || voice.lang})`;
+      ui.setText(playerSource, `Giọng đọc trình duyệt (${voice.name || voice.lang})`);
     }
     setPlayerStatus("Đang phát giọng đọc trình duyệt", "badge-info");
     hideRetryBanner();
@@ -553,7 +561,7 @@ class TourStateManager {
     currentNarrationPayload = { audio_url, translated_text, lang, key };
 
     if (playerText) {
-      playerText.textContent = translated_text || "(Không có văn bản)";
+      playerText.textContent = translated_text || t("(Không có văn bản)");
     }
     if (btnAudioReplay) btnAudioReplay.disabled = false;
     hidePermissionBanner();
@@ -561,7 +569,7 @@ class TourStateManager {
 
     if (audio_url) {
       // 1. Phát qua MP3 từ Gateway (same origin)
-      if (playerSource) playerSource.textContent = "Bản thuyết minh MP3";
+      if (playerSource) ui.setText(playerSource, "Bản thuyết minh MP3");
       audioElement.src = audio_url;
       audioElement.muted = isMuted;
 
@@ -608,7 +616,7 @@ class TourStateManager {
     } else {
       manager.markPlaybackError("no_audio_or_text");
       setPlayerStatus("Không có nội dung âm thanh hoặc văn bản", "badge-neutral");
-      if (playerSource) playerSource.textContent = "--";
+      if (playerSource) ui.setText(playerSource, "--");
     }
   }
 
@@ -621,7 +629,7 @@ class TourStateManager {
 
     if (!res.accepted) {
       setGpsStatus(`GPS chưa ổn định (±${Math.round(coords.accuracy)}m > 50m)`, "badge-warning");
-      accuracyDisplay.textContent = `±${Math.round(coords.accuracy)}m (Kém)`;
+      ui.setText(accuracyDisplay, `±${Math.round(coords.accuracy)}m (Kém)`);
       return;
     }
 
@@ -632,8 +640,8 @@ class TourStateManager {
 
     setGpsStatus("Đang nhận GPS", "badge-success");
     coordsDisplay.textContent = `${coords.latitude.toFixed(5)}, ${coords.longitude.toFixed(5)}`;
-    accuracyDisplay.textContent = `±${Math.round(coords.accuracy)}m`;
-    timestampDisplay.textContent = new Date(now).toLocaleTimeString();
+    ui.setText(accuracyDisplay, `±${Math.round(coords.accuracy)}m`);
+    timestampDisplay.textContent = new Date(now).toLocaleTimeString({vi: "vi-VN", en: "en-US", ja: "ja-JP"}[langSelect.value]);
 
     checkAndSendDetect();
   }
@@ -653,7 +661,7 @@ class TourStateManager {
     }
     setGpsStatus(msg, "badge-danger");
     coordsDisplay.textContent = "--";
-    accuracyDisplay.textContent = "--";
+    ui.setText(accuracyDisplay, "--");
   }
 
   async function checkAndSendDetect() {
@@ -706,7 +714,7 @@ class TourStateManager {
         stopCurrentAudio();
         currentNarrationPayload = null;
         if (btnAudioReplay) btnAudioReplay.disabled = true;
-        if (playerText) playerText.textContent = "Đang chờ bản thuyết minh mới...";
+        if (playerText) playerText.textContent = t("Đang chờ bản thuyết minh mới...");
       }
 
       if (evalResult.action === "play") {
@@ -739,11 +747,11 @@ class TourStateManager {
       detectedContent.classList.remove("hidden");
 
       const loc = data.location;
-      placeName.textContent = loc.name || "Địa điểm không tên";
-      activationBadge.textContent = "Trong bán kính kích hoạt";
+      placeName.textContent = loc.name || t("Địa điểm không tên");
+      ui.setText(activationBadge, "Trong bán kính kích hoạt");
       activationBadge.className = "badge badge-success";
 
-      placeDistance.textContent = data.distance_m !== null ? `${data.distance_m} m` : "--";
+      ui.setText(placeDistance, data.distance_m !== null ? `${data.distance_m} m` : "--");
       placeSource.textContent = loc.source === "wikimedia" ? "Wikipedia (Wikimedia)" : (loc.source || "Manual");
 
       if (data.source_url) {
@@ -759,19 +767,19 @@ class TourStateManager {
       if (["pending", "processing"].includes(data.narration_status)) statusLabel = "Đang biên soạn và tạo âm thanh, vui lòng chờ...";
       if (data.narration_status === "text_ready") statusLabel = "Sẵn sàng văn bản (Dùng Web Speech)";
       if (data.narration_status === "error") statusLabel = `Lỗi tạo âm thanh (${data.reason || "Xem chi tiết"})`;
-      narrationStatus.textContent = statusLabel;
+      ui.setText(narrationStatus, statusLabel);
 
-      placeDesc.textContent = data.translated_text || loc.description_source || loc.description_vi || "(Không có mô tả)";
+      placeDesc.textContent = data.translated_text || loc.description_source || loc.description_vi || t("(Không có mô tả)");
     } else if (data.reason === "outside_activation_radius" && data.location) {
       noDetectBox.classList.add("hidden");
       detectedContent.classList.remove("hidden");
 
       const loc = data.location;
-      placeName.textContent = loc.name || "Địa điểm lân cận";
-      activationBadge.textContent = "Ngoài bán kính kích hoạt";
+      placeName.textContent = loc.name || t("Địa điểm lân cận");
+      ui.setText(activationBadge, "Ngoài bán kính kích hoạt");
       activationBadge.className = "badge badge-warning";
 
-      placeDistance.textContent = data.distance_m !== null ? `${data.distance_m} m (Cần lại gần hơn)` : "--";
+      ui.setText(placeDistance, data.distance_m !== null ? `${data.distance_m} m (Cần lại gần hơn)` : "--");
       placeSource.textContent = loc.source === "wikimedia" ? "Wikipedia (Wikimedia)" : (loc.source || "Manual");
 
       if (data.source_url) {
@@ -782,30 +790,31 @@ class TourStateManager {
         sourceLinkRow.style.display = "none";
       }
 
-      narrationStatus.textContent = "Không kích hoạt (Ngoài bán kính)";
-      placeDesc.textContent = loc.description_source || loc.description_vi || "(Không có mô tả)";
+      ui.setText(narrationStatus, "Không kích hoạt (Ngoài bán kính)");
+      placeDesc.textContent = loc.description_source || loc.description_vi || t("(Không có mô tả)");
     } else {
       detectedContent.classList.add("hidden");
       noDetectBox.classList.remove("hidden");
 
       if (data.reason === "upstream_unavailable") {
-        noDetectBox.textContent = "Máy chủ nội bộ (Content Service) tạm thời gián đoạn kết nối.";
+        ui.setText(noDetectBox, "Máy chủ nội bộ (Content Service) tạm thời gián đoạn kết nối.");
       } else {
-        noDetectBox.textContent = "Không tìm thấy địa điểm nào trong phạm vi 500m.";
+        ui.setText(noDetectBox, "Không tìm thấy địa điểm nào trong phạm vi 500m.");
       }
     }
   }
 
   function renderCandidates(candidates) {
+    lastCandidates = candidates || [];
     if (!candidates || candidates.length === 0) {
-      candidatesList.innerHTML = '<p class="empty-note">Chưa có dữ liệu ứng viên trong 500m.</p>';
+      candidatesList.innerHTML = `<p class="empty-note">${t("Chưa có dữ liệu ứng viên trong 500m.")}</p>`;
       return;
     }
 
     candidatesList.innerHTML = candidates.map(c => `
       <div class="candidate-item">
         <strong>${c.name}</strong> (${c.distance_m ? Math.round(c.distance_m) + "m" : "--"})
-        <br><small>Bán kính kích hoạt: ${c.radius || 80}m | Nguồn: ${c.source || "manual"}</small>
+        <br><small>${t("Bán kính kích hoạt:")} ${c.radius || 80}m | ${t("Nguồn:")} ${c.source || "manual"}</small>
       </div>
     `).join("");
   }
@@ -857,6 +866,8 @@ class TourStateManager {
 
   langSelect.addEventListener("change", () => {
     manager.setLanguage(langSelect.value);
+    ui.apply(langSelect.value);
+    renderCandidates(lastCandidates);
     stopCurrentAudio();
     manager.narrationState = "idle";
     currentNarrationPayload = null;
@@ -911,7 +922,7 @@ class TourStateManager {
     btnAudioMute.addEventListener("click", () => {
       isMuted = !isMuted;
       audioElement.muted = isMuted;
-      btnAudioMute.textContent = isMuted ? "🔊 Bật tiếng" : "🔇 Tắt tiếng";
+      ui.setText(btnAudioMute, isMuted ? "🔊 Bật tiếng" : "🔇 Tắt tiếng");
       if (isMuted && activeAudioSource === "speech" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
       }

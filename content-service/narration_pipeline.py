@@ -13,7 +13,7 @@ from datetime import timedelta
 
 import httpx
 
-from narration_clients import NarrationClients, PipelineError
+from narration_clients import NarrationClients, PipelineError, RETRYABLE_CODES
 from narration_store import NarrationStore, now
 
 DEFAULT_VOICES = {"vi": "vi-VN-HoaiMyNeural", "en": "en-US-JennyNeural", "ja": "ja-JP-NanamiNeural"}
@@ -86,7 +86,7 @@ class NarrationPipeline:
                 if await self.clients.exists(client, row["storage_path"]):
                     return await self.ready_response(client, row)
                 await asyncio.to_thread(self.store.invalidate_audio, row)
-        exhausted = row["attempts"] >= 3 and row["status"] == "failed"
+        exhausted = row["status"] == "failed" and (row["attempts"] >= 3 or row["error_code"] not in RETRYABLE_CODES)
         return {"narration_status": "error" if exhausted else "processing",
                 "requested_lang": language, "job_id": row["id"],
                 "reason": row["error_code"], "retry_after": 10, "cache_hit": False}
@@ -105,9 +105,13 @@ class NarrationPipeline:
             await asyncio.wait_for(self.generate_steps(row), timeout=180)
         except Exception as exc:
             code = str(exc) if isinstance(exc, PipelineError) else type(exc).__name__
+            self.clients.diagnostic("job_failed", job_id=row["id"], code=code,
+                validation=exc.detail if isinstance(exc, PipelineError) else type(exc).__name__,
+                retryable=code in RETRYABLE_CODES)
             try:
                 await asyncio.to_thread(self.store.save, row, status="failed", error_code=code,
-                    retry_at=now() + timedelta(seconds=10 * 2 ** (row["attempts"] - 1)))
+                    retry_at=(now() + timedelta(seconds=10 * 2 ** (row["attempts"] - 1))
+                              if code in RETRYABLE_CODES else None))
             except Exception:
                 # Database mất kết nối: lease cho phép request sau phục hồi.
                 logging.getLogger(__name__).warning("Không lưu được trạng thái job %s", row["id"])

@@ -40,12 +40,12 @@ trong đồ án. Vẫn có đúng ba service, giao diện GPS và Dashboard cũ.
    chính xác. Làm sạch HTML, chú thích, phần tham khảo rồi lưu checkpoint nguồn.
    Nguồn thiếu/rỗng: trả trạng thái lỗi, không bịa thêm nội dung.
 5. Gemini viết lời thuyết minh bằng ngôn ngữ yêu cầu. Kiểm tra kết thúc thành công,
-   văn bản thuần, độ dài 20–1200 ký tự; chuẩn hóa khoảng trắng một lần rồi lưu.
+   văn bản thuần có chữ, không rỗng và tối đa 1200 ký tự; chuẩn hóa khoảng trắng rồi lưu.
 6. Content gửi chính văn bản đã lưu đến `POST Translate Audio /text-to-speech`.
    Edge TTS tạo MP3; Content kiểm tra voice và hash của văn bản trả về.
 7. Content tải MP3 tối đa 2 MB từ API nội bộ, kiểm tra header MP3, upload lên
    bucket riêng tư. Chỉ sau khi Storage xác nhận file tồn tại mới ghi `ready`.
-8. Giao diện kiểm tra lại qua detect khoảng 10 giây/lần khi đang theo dõi GPS và
+8. Giao diện kiểm tra lại qua detect mỗi 3 giây khi đang tạo, còn lại 10 giây, khi đang theo dõi GPS và
    có fix hợp lệ. `processing`/`error` không kích hoạt đọc mô tả nguồn.
    Sau khi dừng GPS, công việc đã nhận vẫn có thể hoàn tất; lần truy cập sau dùng lại.
 
@@ -81,8 +81,9 @@ process Translate Audio. Chạy một worker/service theo cấu hình Render hi�
 Nếu nhân số instance, tổng số job có thể tăng theo số instance; khóa theo bản
 thuyết minh vẫn có hiệu lực toàn database.
 
-Retry HTTP tối đa ba lần khi lỗi mạng/429/5xx, backoff 0,5 và 1 giây; lỗi 4xx khác
-không retry. Job có tối đa ba lượt tạo, chờ 10 rồi 20 giây giữa các lượt. Request
+Retry HTTP tối đa ba lần khi lỗi mạng/429/500/502/503/504; lỗi cố định không retry.
+TTS chỉ retry bên trong Edge, không nhân thêm retry HTTP ở Content. Job lỗi tạm
+thời có tối đa ba lượt tạo, chờ 10 rồi 20 giây giữa các lượt. Request
 polling tiếp theo thực hiện retry khi đến hạn. Không có worker chạy nền riêng.
 Restart sau khi lấy lease: chờ lease hết hạn rồi request mới tiếp tục checkpoint.
 Nếu upload đã xong nhưng chưa ghi ready, đường dẫn đã lưu giúp tìm lại MP3.
@@ -91,7 +92,8 @@ Nếu file tạm mất sau restart, chỉ tạo lại TTS từ văn bản Gemini
 Kết quả API ngoài thành công nhưng chưa kịp checkpoint khi process chết vẫn có
 thể phải gọi lại API đó; không cam kết exactly-once với nhà cung cấp bên ngoài.
 
-Sau ba lượt lỗi, xem `error_code` trong Supabase. Sửa cấu hình/nguyên nhân trước,
+Lỗi cố định dừng ngay lượt đầu. Xem `error_code` trong Supabase và
+[hướng dẫn điều tra Gemini](gemini-invalid-text.md). Sửa cấu hình/nguyên nhân trước,
 rồi quản trị viên có thể thử lại đúng job bằng SQL sau (thay ID thực tế):
 
 ```sql
@@ -119,8 +121,8 @@ thuyết minh trả 409 để tránh mất dữ liệu; cần chính sách lưu 
    tương thích pooler. Pool trong Content tối đa năm kết nối/process.
 3. Cấu hình `SUPABASE_URL`, `SUPABASE_SECRET_KEY` (backend secret key hoặc JWT
    service_role cũ), `SUPABASE_AUDIO_BUCKET`, `GEMINI_API_KEY`, `GEMINI_MODEL`.
-   Mẫu dùng `gemini-3.8-flash`; có thể đổi sang model có quyền sử dụng trong
-   project. Giá trị mẫu không bảo đảm quota.
+   Mẫu dùng `gemini-3.5-flash-lite`, khớp render.yaml và code. Xác minh quyền/quota
+   bằng `content-service/diagnose_narration.py`; không tự đổi model khi gặp lỗi.
 4. Các tùy chọn: `CONTENT_VERSION=v1`, `NARRATION_TARGET_CHARS=900` (100–1200),
    `NARRATION_MAX_CONCURRENT=2`, `TTS_MAX_CONCURRENT=2`,
    `TTS_CONFIG_VERSION=v1`, `TTS_TIMEOUT_SECONDS=25`,

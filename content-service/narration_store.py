@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from models import Location, Narration, SessionLocal
+from narration_clients import RETRYABLE_CODES
 
 
 def now():
@@ -43,7 +44,8 @@ class NarrationStore:
                 "location_id", "language", "voice", "content_version"]))
             eligible = or_(
                 Narration.status == "pending",
-                and_(Narration.status == "failed", Narration.retry_at <= current),
+                and_(Narration.status == "failed", Narration.retry_at <= current,
+                     Narration.error_code.in_(RETRYABLE_CODES)),
                 and_(Narration.status == "processing", Narration.lease_until <= current))
             row = db.execute(update(Narration).filter_by(**key).where(
                 eligible, Narration.attempts < max_attempts).values(

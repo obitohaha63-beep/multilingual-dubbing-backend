@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import edge_tts
+from aiohttp import ClientConnectionError
 
 EDGE_TTS_VERSION: str = getattr(edge_tts, "__version__", "unknown")
 logger = logging.getLogger("translate_audio.tts")
@@ -91,7 +92,10 @@ class UnsupportedLanguageError(Exception):
 class TTSError(Exception):
     """Ngoại lệ khi quá trình chuyển văn bản thành giọng nói gặp lỗi."""
 
-    pass
+    def __init__(self, message, *, cause=None, retryable=False):
+        super().__init__(message)
+        self.cause = cause
+        self.retryable = retryable
 
 
 class TTSTimeoutError(TTSError):
@@ -367,7 +371,13 @@ async def synthesize_speech(
                     str(exc),
                 )
 
-                if attempt < max_retries:
+                # NoAudioReceived can be transient after validated input; retry here only.
+                status = getattr(exc, "status", None)
+                transient = (isinstance(exc, (asyncio.TimeoutError, ConnectionError,
+                                               ClientConnectionError,
+                                               edge_tts.exceptions.NoAudioReceived))
+                             or status in {429, 500, 502, 503, 504})
+                if transient and attempt < max_retries:
                     delay = retry_delays[attempt]
                     logger.info("Chờ %.1fs trước khi thử lại Edge TTS...", delay)
                     await asyncio.sleep(delay)
@@ -382,10 +392,11 @@ async def synthesize_speech(
                         raise
                     if isinstance(exc, asyncio.TimeoutError):
                         raise TTSTimeoutError(
-                            f"Edge TTS không phản hồi sau {timeout} giây"
+                            f"Edge TTS không phản hồi sau {timeout} giây", cause=err_type, retryable=True
                         ) from exc
                     raise TTSError(
-                        f"Lỗi tạo âm thanh với Edge TTS ({err_type}): {str(exc)}"
+                        f"Lỗi tạo âm thanh với Edge TTS ({err_type}): {str(exc)}",
+                        cause=err_type, retryable=transient and err_type != "NoAudioReceived"
                     ) from exc
 
         # Kiểm tra xác nhận file cuối cùng đã ghi đĩa thành công và hợp lệ

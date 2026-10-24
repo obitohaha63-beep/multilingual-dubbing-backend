@@ -232,7 +232,7 @@ def test_missing_storage_rebuilds_audio_without_gemini(setup_pipeline):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("text", ["", "ngắn", "x" * 1201, "<p>Văn bản không phù hợp để đọc.</p>",
+@pytest.mark.parametrize("text", ["", "x" * 1201, "<p>Văn bản không phù hợp để đọc.</p>",
                                   "# Tiêu đề Markdown không phù hợp", "123456789012345678901234"])
 def test_invalid_gemini_never_calls_tts(setup_pipeline, text):
     pipeline, _, apis, sessions = setup_pipeline
@@ -241,19 +241,20 @@ def test_invalid_gemini_never_calls_tts(setup_pipeline, text):
     assert read_row(sessions).status == "failed" and apis.calls["tts"] == 0
 
 
-def test_retry_is_bounded_and_respects_backoff(setup_pipeline):
+def test_fixed_failure_never_retries_on_polling(setup_pipeline):
     pipeline, _, apis, sessions = setup_pipeline
     apis.invalid_text = ""
     async def run():
         await finish(pipeline)
         await finish(pipeline)
         assert read_row(sessions).attempts == 1
-        for _ in range(2):
+        for _ in range(4):
             allow_retry(sessions)
             await finish(pipeline)
         allow_retry(sessions)
         result = await finish(pipeline)
-        assert result["narration_status"] == "error" and read_row(sessions).attempts == 3
+        assert result["narration_status"] == "error" and read_row(sessions).attempts == 1
+        assert apis.calls["gemini"] == 1 and apis.calls["tts"] == 0
     asyncio.run(run())
 
 
@@ -318,4 +319,105 @@ def test_gemini_timeout():
     with pytest.raises(PipelineError) as exc_info:
         asyncio.run(clients.compose(client, "Nội dung kiểm tra địa điểm", "vi", job_id="test_job"))
     assert exc_info.value.code == "gemini_timeout"
+
+
+@pytest.mark.parametrize("source", [None, {}, [], 123, "", " \t\n ", "\u200b\ufeff", "abc\x00def", "x" * 12001])
+def test_source_rejected_before_network(source):
+    clients = NarrationClients()
+    clients.gemini_key = "secret-for-test"
+    calls = []
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: calls.append(req))) as client:
+            with pytest.raises(PipelineError):
+                await clients.compose(client, source, "vi")
+        assert calls == []
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("payload,code", [
+    ({"promptFeedback": {"blockReason": "SAFETY"}}, "gemini_blocked"),
+    ({"candidates": []}, "gemini_empty_text"),
+    ({"candidates": [{"finishReason": "SAFETY"}]}, "gemini_blocked"),
+    ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "gemini_incomplete"),
+    ({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"thought": True, "text": "Reasoning only"}]}}]}, "gemini_empty_text"),
+    ({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": None}]}}]}, "gemini_invalid_response"),
+    ({"candidates": "wrong_type"}, "gemini_invalid_response"),
+    ([], "gemini_invalid_response"),
+])
+def test_actual_response_classification_without_retry(payload, code):
+    clients = NarrationClients()
+    clients.gemini_key = "secret-for-test"
+    calls = []
+    def respond(req):
+        calls.append(req)
+        return httpx.Response(200, json=payload)
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            with pytest.raises(PipelineError, match=code):
+                await clients.compose(client, "Nguồn Wikimedia có dữ kiện lịch sử.", "ja")
+        assert len(calls) == 1
+    asyncio.run(run())
+
+
+def test_parts_request_and_safe_diagnostics(caplog):
+    clients = NarrationClients()
+    clients.gemini_key = "secret-for-test"
+    caplog.set_level("INFO")
+    def respond(req):
+        assert req.url.path.endswith(f"/models/{clients.model}:generateContent")
+        assert "key" not in req.url.params
+        assert req.headers["x-goog-api-key"] == clients.gemini_key
+        body = json.loads(req.content)
+        assert body["contents"] == [{"role": "user", "parts": [{"text": "Nguồn gốc đầy đủ."}]}]
+        assert body["systemInstruction"]["parts"][0]["text"]
+        return httpx.Response(200, json={"modelVersion": clients.model,
+            "usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 12, "totalTokenCount": 52},
+            "promptFeedback": {}, "candidates": [{"finishReason": "STOP", "content": {"parts": [
+                {"thought": True, "text": "private reasoning"}, {"text": "京都は"}, {"text": "古都です。"}]}}]})
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            assert await clients.compose(client, " Nguồn gốc\n đầy đủ. ", "ja") == "京都は古都です。"
+    asyncio.run(run())
+    clients.diagnostic("api_error", error={"message": "key=" + clients.gemini_key, "apiKey": "other-key"})
+    assert clients.gemini_key not in caplog.text and "other-key" not in caplog.text
+    assert "private reasoning" not in caplog.text and "Nguồn gốc đầy đủ" not in caplog.text
+    assert '"promptTokenCount": 40' in caplog.text and '"http_status": 200' in caplog.text
+
+
+def test_source_is_never_silently_truncated():
+    with pytest.raises(PipelineError, match="source_too_long"):
+        clean_source("Đây là dữ kiện lịch sử. " * 1000)
+    assert check_text("京都は古都です。") == "京都は古都です。"
+
+
+def test_tts_no_audio_does_not_restart_job(setup_pipeline, monkeypatch):
+    pipeline, _, apis, sessions = setup_pipeline
+    async def no_audio(client, row):
+        apis.calls["tts"] += 1
+        raise PipelineError("tts_no_audio")
+    monkeypatch.setattr(pipeline.clients, "speech", no_audio)
+    async def run():
+        await finish(pipeline)
+        for _ in range(4):
+            allow_retry(sessions)
+            result = await finish(pipeline)
+        assert result["narration_status"] == "error"
+        assert apis.calls["gemini"] == apis.calls["tts"] == 1
+        assert not apis.objects and read_row(sessions).final_text == TEXT
+    asyncio.run(run())
+
+
+def test_tts_terminal_response_not_retried():
+    clients = NarrationClients()
+    calls = []
+    def respond(req):
+        calls.append(req)
+        return httpx.Response(503, json={"detail": {"code": "tts_unavailable",
+            "cause": "NoAudioReceived", "retryable": False}})
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            with pytest.raises(PipelineError, match="tts_no_audio"):
+                await clients.speech(client, {"final_text": TEXT, "language": "vi", "voice": choose_voice("vi")})
+        assert len(calls) == 1
+    asyncio.run(run())
 

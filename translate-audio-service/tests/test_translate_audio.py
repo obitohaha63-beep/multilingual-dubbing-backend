@@ -1001,4 +1001,26 @@ def test_tts_retries_exhausted_returns_503(tmp_path, monkeypatch):
     data = resp.json()
     assert data["detail"]["code"] == "tts_unavailable"
     assert "NoAudioReceived" in data["detail"]["message"]
+    assert data["detail"]["cause"] == "NoAudioReceived"
+    assert data["detail"]["retryable"] is False
+
+
+def test_tts_fixed_provider_error_is_not_retried(tmp_path, monkeypatch):
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    attempts = 0
+
+    class InvalidCommunicate:
+        def __init__(self, text, voice):
+            pass
+
+        async def save(self, filepath):
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("Invalid provider parameters")
+
+    monkeypatch.setattr("edge_tts.Communicate", InvalidCommunicate)
+    response = client.post("/text-to-speech", json={"text": "Văn bản kiểm thử hợp lệ.", "lang": "vi"})
+    assert response.status_code == 503
+    assert attempts == 1
+    assert response.json()["detail"]["retryable"] is False
 

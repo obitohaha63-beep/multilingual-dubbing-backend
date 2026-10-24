@@ -15,5 +15,5 @@ for directory, files in commands:
     result = subprocess.run([sys.executable, "-m", "pytest", *files, "-q", "--tb=short",
         f"--basetemp={root / '.pytest-work' / directory}"], cwd=root / directory)
     failed = failed or result.returncode != 0
-result = subprocess.run(["node", "--test", "tests/test_client_logic.test.js"], cwd=root)
+result = subprocess.run(["node", "--test", "tests/test_client_logic.test.js", "tests/test_client_i18n.test.js"], cwd=root)
 sys.exit(1 if failed or result.returncode else 0)

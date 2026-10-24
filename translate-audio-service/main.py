@@ -442,6 +442,8 @@ async def text_to_speech(req: TextToSpeechRequest):
                 "detail": {
                     "code": "tts_unavailable",
                     "message": str(exc),
+                    "cause": exc.cause,
+                    "retryable": exc.retryable,
                 }
             },
         )

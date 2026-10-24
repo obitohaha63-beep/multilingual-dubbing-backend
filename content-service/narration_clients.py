@@ -6,11 +6,18 @@ import json
 import logging
 import os
 import re
+import time
+import unicodedata
 from urllib.parse import quote
 
 import httpx
 
-logger = logging.getLogger("narration_clients")
+logger = logging.getLogger("uvicorn.error.narration_clients")
+
+# Shared with the durable job scheduler: fixed failures must not restart on polling.
+RETRYABLE_CODES = frozenset({"gemini_timeout", "gemini_network_error", "gemini_quota_exceeded",
+    "gemini_server_error", "wikimedia_unavailable", "tts_unavailable", "storage_unavailable",
+    "upload_failed", "upload_not_confirmed", "tts_file_missing", "TimeoutError"})
 
 
 class PipelineError(Exception):
@@ -24,14 +31,34 @@ class PipelineError(Exception):
         self.code = code
         self.detail = detail
 
+    @property
+    def retryable(self):
+        return self.code in RETRYABLE_CODES
+
+
+def normalize_text(text, code):
+    if not isinstance(text, str):
+        raise PipelineError(code, "not_string")
+    # Keep letters, accents and Unicode format characters; reject XML-unsafe controls.
+    if any(unicodedata.category(c) in {"Cc", "Cs"} and c not in "\t\r\n" for c in text):
+        raise PipelineError(code, "control_character")
+    return re.sub(r"\s+", " ", text).strip()
+
 
 def clean_source(text):
+    if not isinstance(text, str):
+        raise PipelineError("source_invalid_text", "not_string")
     text = html.unescape(text)
     text = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.split(r"(?im)^\s*={2,}\s*(Tham khảo|Liên kết ngoài|Xem thêm|References|External links)\b", text)[0]
     text = re.sub(r"\[\d+\]", "", text)
-    return re.sub(r"\s+", " ", text).strip()[:12000]
+    text = normalize_text(text, "source_invalid_text")
+    if not text:
+        raise PipelineError("source_invalid_text", "empty")
+    if len(text) > 12000:
+        raise PipelineError("source_too_long", "source exceeds 12000 characters; not truncated")
+    return text
 
 
 def check_text(text):
@@ -39,10 +66,13 @@ def check_text(text):
         raise PipelineError("gemini_invalid_text", "Phản hồi không phải dạng chuỗi")
     if re.search(r"(?:^|\n)\s*(?:#{1,6}\s|[-*]\s|\d+\.\s)|\*\*", text):
         raise PipelineError("gemini_invalid_text", "Văn bản chứa markdown formatting không hợp lệ cho TTS")
-    text = re.sub(r"\s+", " ", text).strip()
-    if (not 20 <= len(text) <= 1200 or not any(c.isalpha() for c in text)
-            or re.search(r"<[^>]+>|```|https?://", text)):
-        raise PipelineError("gemini_invalid_text", f"Độ dài hoặc ký tự không hợp lệ ({len(text)} ký tự)")
+    text = normalize_text(text, "gemini_invalid_text")
+    if not text:
+        raise PipelineError("gemini_empty_text", "empty_visible_text")
+    if len(text) > 1200:
+        raise PipelineError("gemini_invalid_text", f"too_long: {len(text)} > 1200")
+    if not any(c.isalpha() for c in text) or re.search(r"<[^>]+>|```|https?://", text):
+        raise PipelineError("gemini_invalid_text", "non_speech_format")
     return text
 
 
@@ -51,8 +81,8 @@ class NarrationClients:
         self.url = os.getenv("SUPABASE_URL", "").rstrip("/")
         self.secret = os.getenv("SUPABASE_SECRET_KEY", "")
         self.bucket = os.getenv("SUPABASE_AUDIO_BUCKET", "narration-audio")
-        self.gemini_key = os.getenv("GEMINI_API_KEY", "")
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip().removeprefix("models/")
         self.target_chars = int(os.getenv("NARRATION_TARGET_CHARS", "900"))
         if not 100 <= self.target_chars <= 1200:
             raise PipelineError("invalid_target_chars")
@@ -61,19 +91,40 @@ class NarrationClients:
         # JWT service_role cũ dùng Bearer; secret key mới chỉ dùng apikey.
         if self.secret.startswith("eyJ"):
             self.headers["Authorization"] = f"Bearer {self.secret}"
+        self.diagnostic("configuration", model=self.model, api_key_present=bool(self.gemini_key),
+                        endpoint="https://generativelanguage.googleapis.com/v1beta/models/:generateContent")
+
+    def diagnostic(self, event, **fields):
+        """Structured provider diagnostics, without prompts, credentials or response text."""
+        def redact(value):
+            if isinstance(value, dict):
+                return {k: ("[REDACTED]" if re.search(r"key|token|authorization|secret|signature", k, re.I)
+                            and k not in {"api_key_present", "promptTokenCount", "candidatesTokenCount",
+                                          "totalTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"}
+                            else redact(v)) for k, v in value.items()}
+            if isinstance(value, list):
+                return [redact(v) for v in value]
+            if isinstance(value, str):
+                for secret in (self.gemini_key, self.secret):
+                    if secret:
+                        value = value.replace(secret, "[REDACTED]")
+                value = re.sub(r"AIza[\w-]+", "[REDACTED]", value)
+                value = re.sub(r"(?i)(key|token|authorization|secret|signature)=([^\s&]+)", r"\1=[REDACTED]", value)
+            return value
+        logger.info("[Gemini] %s", json.dumps(redact({"event": event, **fields}), ensure_ascii=True))
 
     def configured(self):
         return bool(self.url.startswith("https://") and self.secret and self.gemini_key)
 
     async def request(self, client, method, url, code, **kwargs):
-        """Tối đa 3 lần, backoff 0.5s/1s, chỉ retry mạng, 429, 5xx."""
+        """Tối đa 3 lần, backoff 0.5s/1s, chỉ retry mạng và HTTP tạm thời."""
         for attempt in range(3):
             try:
                 response = await client.request(method, url, **kwargs)
                 if response.status_code < 400:
                     return response
-                if response.status_code != 429 and response.status_code < 500:
-                    raise PipelineError(code)
+                if response.status_code not in {429, 500, 502, 503, 504}:
+                    raise PipelineError(f"{code}_http_{response.status_code}")
             except httpx.RequestError:
                 pass
             if attempt < 2:
@@ -101,19 +152,38 @@ class NarrationClients:
             url = page.get("fullurl", "")
             if page.get("missing") or len(text) < 40 or not url.startswith("https://"):
                 raise PipelineError("source_insufficient")
+            self.diagnostic("source_ready", source_lang=lang, source_page_id=page.get("pageid"),
+                            input_length=len(text), raw_length=len(page.get("extract", "")))
             return text, url
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             raise PipelineError("wikimedia_invalid_response") from exc
 
     async def compose(self, client, source, language, job_id=None):
+        try:
+            source = normalize_text(source, "source_invalid_text")
+            if not source:
+                raise PipelineError("source_invalid_text", "empty")
+            if not any(c.isalpha() for c in source):
+                raise PipelineError("source_invalid_text", "no_readable_text")
+            if len(source) > 12000:
+                raise PipelineError("source_too_long", f"length={len(source)}")
+            if language not in {"vi", "en", "ja"}:
+                raise PipelineError("unsupported_language")
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", self.model):
+                raise PipelineError("gemini_invalid_model")
+        except PipelineError as exc:
+            self.diagnostic("input_rejected", job_id=job_id, model=self.model,
+                            input_length=len(source) if isinstance(source, str) else None,
+                            code=exc.code, validation=exc.detail)
+            raise
         if not self.gemini_key:
-            logger.error("[Gemini] GEMINI_API_KEY chưa được cấu hình. job_id=%s model=%s", job_id, self.model)
+            self.diagnostic("configuration_error", job_id=job_id, model=self.model, api_key_present=False)
             raise PipelineError("gemini_auth_error", "GEMINI_API_KEY is not configured")
 
         languages = {"vi": "tiếng Việt", "en": "English", "ja": "日本語"}
         target_language_name = languages.get(language, language)
         instruction = (
-            f"Viết lời thuyết minh du lịch bằng {target_language_name}, khoảng {self.target_chars} ký tự, "
+            f"Viết lời thuyết minh du lịch bằng {target_language_name}, tối đa {min(self.target_chars, 1050)} ký tự kể cả khoảng trắng, "
             "tuyệt đối không quá 1200 ký tự. Chỉ trả lời văn bản thuần để đọc thành giọng nói, "
             "không tiêu đề, markdown hay URL. Trình tự rõ ràng, tự nhiên, không lặp ý. "
             "Chỉ dùng dữ kiện trong nguồn, giữ các mốc lịch sử và giá trị văn hóa quan trọng. "
@@ -131,22 +201,21 @@ class NarrationClients:
         # Gọi Gemini: retry tối đa 3 lần cho 429, 5xx và lỗi mạng. Lỗi 400, 401, 403, 404 không retry.
         max_attempts = 3
         for attempt in range(max_attempts):
+            started = time.monotonic()
+            self.diagnostic("request", model=self.model, endpoint=url, job_id=job_id,
+                            input_length=len(source), attempt=attempt + 1, api_key_present=True)
             try:
                 response = await client.post(url, headers=headers, json=payload, timeout=40)
             except httpx.TimeoutException as exc:
-                logger.warning(
-                    "[Gemini] Timeout khi gọi API. attempt=%d/%d model=%s job_id=%s exc=%s",
-                    attempt + 1, max_attempts, self.model, job_id, type(exc).__name__
-                )
+                self.diagnostic("timeout", attempt=attempt + 1, model=self.model, job_id=job_id,
+                                input_length=len(source), response_status="timeout")
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
                 raise PipelineError("gemini_timeout", "Gemini request timed out") from exc
             except httpx.RequestError as exc:
-                logger.warning(
-                    "[Gemini] Network error khi gọi API. attempt=%d/%d model=%s job_id=%s exc=%s",
-                    attempt + 1, max_attempts, self.model, job_id, type(exc).__name__
-                )
+                self.diagnostic("network_error", attempt=attempt + 1, model=self.model, job_id=job_id,
+                                error_type=type(exc).__name__, response_status="network_error")
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
@@ -156,34 +225,47 @@ class NarrationClients:
             if response.status_code < 400:
                 try:
                     res_json = response.json()
+                    if not isinstance(res_json, dict):
+                        raise TypeError("response_not_object")
                     candidates = res_json.get("candidates") or []
+                    feedback = res_json.get("promptFeedback") or {}
+                    self.diagnostic("response", model=self.model, job_id=job_id,
+                        model_version=res_json.get("modelVersion"), response_id=res_json.get("responseId"),
+                        http_status=response.status_code, response_status="received", input_length=len(source),
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                        usageMetadata=res_json.get("usageMetadata"), promptFeedback=feedback,
+                        candidate_count=len(candidates),
+                        finish_reasons=[c.get("finishReason") for c in candidates])
+                    if not isinstance(feedback, dict):
+                        raise TypeError("prompt_feedback_not_object")
+                    block_reason = feedback.get("blockReason")
+                    if block_reason and block_reason != "BLOCK_REASON_UNSPECIFIED":
+                        raise PipelineError("gemini_blocked", f"prompt_block: {block_reason}")
                     if not candidates:
-                        prompt_feedback = res_json.get("promptFeedback", {})
-                        block_reason = prompt_feedback.get("blockReason")
-                        logger.error(
-                            "[Gemini] Không có candidates. blockReason=%s model=%s job_id=%s",
-                            block_reason, self.model, job_id
-                        )
-                        raise PipelineError("gemini_blocked", f"Content blocked by safety: {block_reason}")
+                        raise PipelineError("gemini_empty_text", "no_candidates_without_block_reason")
 
                     candidate = candidates[0]
                     finish_reason = candidate.get("finishReason")
+                    if finish_reason in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"}:
+                        raise PipelineError("gemini_blocked", f"candidate_block: {finish_reason}")
                     if finish_reason != "STOP":
-                        logger.warning(
-                            "[Gemini] finishReason bất thường (%s). model=%s job_id=%s",
-                            finish_reason, self.model, job_id
-                        )
                         raise PipelineError("gemini_incomplete", f"Finish reason: {finish_reason}")
 
                     content = candidate.get("content", {})
                     parts = content.get("parts", [])
                     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-                    return check_text(text)
-                except (ValueError, KeyError, IndexError, TypeError) as exc:
-                    logger.error(
-                        "[Gemini] Phản hồi JSON không hợp lệ. model=%s job_id=%s exc=%s",
-                        self.model, job_id, str(exc)
-                    )
+                    checked = check_text(text)
+                    self.diagnostic("validated", model=self.model, job_id=job_id,
+                                    output_length=len(checked), response_status="valid")
+                    return checked
+                except PipelineError as exc:
+                    self.diagnostic("output_rejected", model=self.model, job_id=job_id,
+                        http_status=response.status_code, code=exc.code, validation=exc.detail,
+                        output_length=len(text) if "text" in locals() else None, response_status="rejected")
+                    raise
+                except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+                    self.diagnostic("invalid_response", model=self.model, job_id=job_id,
+                                    http_status=response.status_code, error_type=type(exc).__name__)
                     raise PipelineError("gemini_invalid_response", "Invalid JSON structure from Gemini") from exc
 
             # Xử lý các HTTP error status
@@ -191,16 +273,17 @@ class NarrationClients:
             error_message = ""
             error_status = ""
             try:
-                err_data = response.json().get("error", {})
-                error_message = err_data.get("message", "")
-                error_status = err_data.get("status", "")
-            except Exception:
-                error_message = response.text[:200]
+                error_body = response.json()
+                err_data = error_body.get("error", error_body) if isinstance(error_body, dict) else error_body
+                if isinstance(err_data, dict):
+                    error_message = err_data.get("message", "")
+                    error_status = err_data.get("status", "")
+            except (ValueError, TypeError, AttributeError):
+                err_data = {"format": "non_json_error", "body_length": len(response.content)}
 
-            logger.error(
-                "[Gemini] API error. http_status=%d status=%s message=%s model=%s attempt=%d/%d job_id=%s",
-                status, error_status, error_message, self.model, attempt + 1, max_attempts, job_id
-            )
+            self.diagnostic("api_error", http_status=status, error=err_data, model=self.model,
+                            attempt=attempt + 1, job_id=job_id, input_length=len(source),
+                            response_status=error_status or "http_error")
 
             # Phân loại lỗi chính xác
             if status == 400:
@@ -214,7 +297,7 @@ class NarrationClients:
                     await asyncio.sleep(1.0 * (2 ** attempt))
                     continue
                 raise PipelineError("gemini_quota_exceeded", f"HTTP 429 Quota Exceeded: {error_message}")
-            if status >= 500:
+            if status in {500, 502, 503, 504}:
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
@@ -226,8 +309,22 @@ class NarrationClients:
         raise PipelineError("gemini_unavailable", "Gemini retries exhausted")
 
     async def speech(self, client, row):
-        response = await self.request(client, "POST", f"{self.tts_url}/text-to-speech", "tts_unavailable",
-            json={"text": row["final_text"], "lang": row["language"], "voice": row["voice"]}, timeout=35)
+        # Edge owns its bounded retries. Do not multiply three Edge attempts by HTTP retries.
+        try:
+            response = await client.post(f"{self.tts_url}/text-to-speech",
+                json={"text": check_text(row["final_text"]), "lang": row["language"], "voice": row["voice"]},
+                timeout=90)
+        except httpx.RequestError as exc:
+            raise PipelineError("tts_unavailable") from exc
+        if response.is_error:
+            try:
+                detail = response.json().get("detail", {})
+            except (ValueError, AttributeError, TypeError):
+                detail = {}
+            code = "tts_unavailable" if response.status_code in {429, 500, 502, 503, 504} else "tts_invalid_request"
+            if isinstance(detail, dict) and detail.get("retryable") is False:
+                code = "tts_no_audio" if detail.get("cause") == "NoAudioReceived" else "tts_failed"
+            raise PipelineError(code)
         try:
             data = response.json()
             filename = data["audio_filename"]
