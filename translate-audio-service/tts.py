@@ -36,12 +36,14 @@ import hashlib
 import logging
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import edge_tts
 
+EDGE_TTS_VERSION: str = getattr(edge_tts, "__version__", "unknown")
 logger = logging.getLogger("translate_audio.tts")
 
 # Danh sách ngôn ngữ được hỗ trợ
@@ -156,6 +158,33 @@ def validate_audio_filename(filename: str) -> bool:
     return bool(SAFE_AUDIO_FILENAME_RE.match(filename))
 
 
+def is_valid_mp3_file(filepath: Path) -> bool:
+    """
+    Xác minh file âm thanh tồn tại trên đĩa và có dữ liệu MP3 hợp lệ:
+    - Kích thước > 0 bytes.
+    - Bắt đầu bằng ID3 tag (ID3v2) hoặc MPEG audio frame sync bits (0xFF, 0xE0).
+    """
+    if not filepath.is_file():
+        return False
+    try:
+        size = filepath.stat().st_size
+        if size == 0:
+            return False
+        with open(filepath, "rb") as f:
+            header = f.read(4)
+        if len(header) < 2:
+            return False
+        # ID3v2 header
+        if header.startswith(b"ID3"):
+            return True
+        # MPEG audio frame header sync bits: 11111111 111xxxxx
+        if header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+            return True
+        return False
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Khóa đồng bộ theo Key (Concurrency Lock Manager)
 # ---------------------------------------------------------------------------
@@ -258,8 +287,15 @@ async def synthesize_speech(
     key_lock = await get_key_lock(cache_key)
     async with key_lock:
         # Kiểm tra file cache bền vững trên đĩa: phải tồn tại và kích thước > 0
-        if filepath.is_file() and filepath.stat().st_size > 0:
-            logger.info("Cache hit cho file audio: %s", filename)
+        # Kiểm tra cache bền vững trên đĩa: file phải tồn tại, kích thước > 0 và là MP3 hợp lệ
+        if is_valid_mp3_file(filepath):
+            file_bytes = filepath.stat().st_size
+            logger.info(
+                "Cache hit cho file audio: %s, voice=%s, bytes=%d",
+                filename,
+                voice,
+                file_bytes,
+            )
             return {
                 "lang": lang_clean,
                 "voice": voice,
@@ -271,58 +307,89 @@ async def synthesize_speech(
 
         # Nếu file chưa tồn tại hoặc bị xóa/hỏng -> tạo mới (không trả cache_hit giả)
         logger.info(
-            "Cache miss (hoặc file vật lý bị mất), bắt đầu tạo audio: %s",
+            "Cache miss (hoặc file không hợp lệ), bắt đầu tạo audio: %s, edge_tts_version=%s, voice=%s",
             filename,
+            EDGE_TTS_VERSION,
+            voice,
         )
 
-        # Atomic write: ghi ra file tạm trong cùng thư mục rồi đổi tên
+        max_retries = 2  # Tối đa 2 lần thử lại (tổng cộng tối đa 3 lần thử)
+        retry_delays = [1.0, 2.0]
         temp_file = target_dir / f"tmp_{cache_key}_{uuid.uuid4().hex}.tmp"
-        try:
-            communicate = edge_tts.Communicate(normalized_text, voice)
-            await asyncio.wait_for(
-                communicate.save(str(temp_file)),
-                timeout=timeout,
-            )
 
-            if not temp_file.is_file() or temp_file.stat().st_size == 0:
-                raise TTSError(
-                    "File âm thanh sau khi tạo bị rỗng hoặc không tồn tại"
+        for attempt in range(max_retries + 1):
+            start_time = time.monotonic()
+            try:
+                # Mỗi lần thử tạo một đối tượng Communicate mới (phiên kết nối mới)
+                communicate = edge_tts.Communicate(normalized_text, voice)
+                await asyncio.wait_for(
+                    communicate.save(str(temp_file)),
+                    timeout=timeout,
                 )
 
-            # Atomic rename (trên cùng filesystem)
-            os.replace(temp_file, filepath)
+                duration_ms = (time.monotonic() - start_time) * 1000
 
-        except asyncio.TimeoutError as exc:
-            if temp_file.is_file():
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
-            logger.error(
-                "Edge TTS timeout sau %.1f giây: text_hash=%s", timeout, text_hash
-            )
-            raise TTSTimeoutError(
-                f"Edge TTS không phản hồi sau {timeout} giây"
-            ) from exc
-        except Exception as exc:
-            if temp_file.is_file():
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
-            logger.error(
-                "Edge TTS gặp lỗi: text_hash=%s, err_type=%s",
-                text_hash,
-                type(exc).__name__,
-            )
-            if isinstance(exc, (TTSError, TTSTimeoutError)):
-                raise
-            raise TTSError(
-                f"Lỗi tạo âm thanh với Edge TTS: {str(exc)}"
-            ) from exc
+                if not is_valid_mp3_file(temp_file):
+                    raise TTSError("File âm thanh sau khi tạo bị rỗng hoặc không đúng định dạng MP3")
 
-        # Kiểm tra xác nhận file cuối cùng đã ghi đĩa thành công
-        if not filepath.is_file() or filepath.stat().st_size == 0:
+                audio_bytes = temp_file.stat().st_size
+                # Atomic rename (trên cùng filesystem)
+                os.replace(temp_file, filepath)
+
+                logger.info(
+                    "Edge TTS tạo âm thanh thành công: edge_tts_version=%s, voice=%s, duration_ms=%.1f, bytes=%d, attempt=%d",
+                    EDGE_TTS_VERSION,
+                    voice,
+                    duration_ms,
+                    audio_bytes,
+                    attempt + 1,
+                )
+                break
+
+            except Exception as exc:
+                duration_ms = (time.monotonic() - start_time) * 1000
+                err_type = type(exc).__name__
+
+                if temp_file.is_file():
+                    try:
+                        temp_file.unlink()
+                    except OSError:
+                        pass
+
+                logger.warning(
+                    "Edge TTS thất bại: edge_tts_version=%s, voice=%s, attempt=%d/%d, duration_ms=%.1f, err_type=%s, err_msg=%s",
+                    EDGE_TTS_VERSION,
+                    voice,
+                    attempt + 1,
+                    max_retries + 1,
+                    duration_ms,
+                    err_type,
+                    str(exc),
+                )
+
+                if attempt < max_retries:
+                    delay = retry_delays[attempt]
+                    logger.info("Chờ %.1fs trước khi thử lại Edge TTS...", delay)
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "Edge TTS hết số lần thử lại: edge_tts_version=%s, voice=%s, err_type=%s",
+                        EDGE_TTS_VERSION,
+                        voice,
+                        err_type,
+                    )
+                    if isinstance(exc, (TTSError, TTSTimeoutError)):
+                        raise
+                    if isinstance(exc, asyncio.TimeoutError):
+                        raise TTSTimeoutError(
+                            f"Edge TTS không phản hồi sau {timeout} giây"
+                        ) from exc
+                    raise TTSError(
+                        f"Lỗi tạo âm thanh với Edge TTS ({err_type}): {str(exc)}"
+                    ) from exc
+
+        # Kiểm tra xác nhận file cuối cùng đã ghi đĩa thành công và hợp lệ
+        if not is_valid_mp3_file(filepath):
             raise TTSError("Không thể xác minh file âm thanh sau khi ghi đĩa")
 
         return {

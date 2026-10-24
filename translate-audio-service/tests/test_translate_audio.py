@@ -933,3 +933,72 @@ def test_tts_explicit_voice_and_reject_wrong_language(tmp_path, monkeypatch):
         assert result.json()["voice"] == "vi-VN-NamMinhNeural"
         bad = client.post("/text-to-speech", json={"text": "Xin chào", "lang": "vi", "voice": "en-US-JennyNeural"})
         assert bad.status_code == 422
+
+
+def test_tts_retries_on_no_audio_received_and_succeeds(tmp_path, monkeypatch):
+    """Giả lập lần 1 gặp NoAudioReceived, lần 2 thành công -> retry tạo phiên mới và trả kết quả."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    import edge_tts.exceptions
+    attempts = 0
+
+    class RetryMockCommunicate:
+        def __init__(self, text: str, voice: str):
+            self.text = text
+            self.voice = voice
+
+        async def save(self, filepath: str):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise edge_tts.exceptions.NoAudioReceived("No audio received from Edge TTS")
+            with open(filepath, "wb") as f:
+                f.write(b"ID3\x03\x00\x00\x00\x00\x00\x10MOCK_MP3_PAYLOAD")
+
+    monkeypatch.setattr("edge_tts.Communicate", RetryMockCommunicate)
+
+    resp = client.post(
+        "/text-to-speech",
+        json={"text": "Thử nghiệm retry khi gặp NoAudioReceived", "lang": "vi"},
+    )
+    assert resp.status_code == 200
+    assert attempts == 2
+    data = resp.json()
+    assert data["cache_hit"] is False
+    audio_path = tmp_path / data["audio_filename"]
+    assert audio_path.is_file()
+    assert audio_path.stat().st_size > 0
+
+
+def test_tts_retries_exhausted_returns_503(tmp_path, monkeypatch):
+    """Giả lập NoAudioReceived liên tục: retry tối đa 2 lần (tổng 3 lần) rồi trả HTTP 503."""
+    monkeypatch.setattr(tts, "AUDIO_DIR", tmp_path)
+    tts.ensure_audio_dir(tmp_path)
+
+    import edge_tts.exceptions
+    attempts = 0
+
+    class PersistentFailCommunicate:
+        def __init__(self, text: str, voice: str):
+            self.text = text
+            self.voice = voice
+
+        async def save(self, filepath: str):
+            nonlocal attempts
+            attempts += 1
+            raise edge_tts.exceptions.NoAudioReceived("No audio received from Edge TTS")
+
+    monkeypatch.setattr("edge_tts.Communicate", PersistentFailCommunicate)
+
+    resp = client.post(
+        "/text-to-speech",
+        json={"text": "Thử nghiệm lỗi kéo dài", "lang": "vi"},
+    )
+    assert resp.status_code == 503
+    # 1 lần đầu + 2 lần retry = 3 lần
+    assert attempts == 3
+    data = resp.json()
+    assert data["detail"]["code"] == "tts_unavailable"
+    assert "NoAudioReceived" in data["detail"]["message"]
+
