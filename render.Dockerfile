@@ -7,9 +7,10 @@
 
 FROM python:3.11-slim
 
-# Cai supervisord (quan ly nhieu tien trinh) va cac goi he thong can thiet
+# Cai supervisord (quan ly nhieu tien trinh) va dos2unix (chuan hoa line ending)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
+    dos2unix \
     && rm -rf /var/lib/apt/lists/*
 
 # Tao thu muc ung dung
@@ -30,7 +31,12 @@ COPY content-service/         /app/content-service/
 COPY gateway-service/         /app/gateway-service/
 COPY translate-audio-service/ /app/translate-audio-service/
 
-# Tao thu muc du lieu runtime (SQLite DB va file am thanh MP3)
+# Chuan hoa line ending sang Unix LF va cap quyen thuc thi cho start.sh
+RUN dos2unix /app/gateway-service/start.sh \
+    && chmod +x /app/gateway-service/start.sh
+
+# Du lieu runtime tam: analytics SQLite va cache Edge TTS.
+# Dia diem/thuyet minh dung DATABASE_URL Supabase, MP3 hoan tat o Supabase Storage.
 RUN mkdir -p /app/data /app/audio_files
 
 # Copy cau hinh supervisord
@@ -47,6 +53,23 @@ ENV TTS_SERVICE_URL=http://127.0.0.1:8002
 # Duong dan du lieu trong container
 ENV DB_PATH=/app/data/content.db
 ENV AUDIO_DIR=/app/audio_files
+
+# Cac bien moi truong mac dinh (tranh loi supervisord status 2 neu chua duoc set tren Render)
+ENV WIKIMEDIA_USER_AGENT="multilingual-dubbing/1.0 (contact@example.com)"
+ENV NARRATION_TTL_DAYS="7"
+ENV TTS_PROVIDER_VI="google"
+ENV GOOGLE_TTS_API_KEY=""
+ENV TTS_TIMEOUT_SECONDS="25.0"
+ENV TTS_CONFIG_VERSION="v1"
+ENV TTS_VOICE_VI="vi-VN-HoaiMyNeural"
+ENV TTS_VOICE_EN="en-US-JennyNeural"
+ENV TTS_VOICE_JA="ja-JP-NanamiNeural"
+ENV GATEWAY_TIMEOUT="6.0"
+ENV GATEWAY_NARRATE_TIMEOUT="30.0"
+ENV ADMIN_PATH="/admin-dashboard/"
+ENV ADMIN_USERNAME="admin"
+ENV ADMIN_PASSWORD=""
+ENV ADMIN_SESSION_SECRET=""
 
 # Mo cong chinh ma Render se expose
 EXPOSE 8000

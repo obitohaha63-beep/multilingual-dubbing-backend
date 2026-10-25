@@ -12,16 +12,29 @@ from __future__ import annotations
 import os
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, Form, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, field_validator
 
+import admin_auth
+import admin_view
+import analytics_store
+
+# Khởi tạo CSDL analytics nếu chưa có
+analytics_store.init_analytics_db()
+
 app = FastAPI(title="gateway-service")
+
+@app.get("/", include_in_schema=False)
+def home():
+    return RedirectResponse(url="/app/", status_code=302)
+
 
 # Regex validate tên file MP3 an toàn chống path traversal
 SAFE_AUDIO_FILENAME_RE = re.compile(
@@ -50,6 +63,7 @@ class DetectRequest(BaseModel):
     longitude: float
     language: str
     accuracy_m: Optional[float] = None
+    voice: Optional[str] = None
 
     @field_validator("latitude")
     @classmethod
@@ -100,6 +114,8 @@ class DetectResponse(BaseModel):
     source_url: Optional[str] = None
     is_fallback: bool = False
     narration_status: Optional[str] = None
+    cache_hit: bool = False
+    retry_after: Optional[int] = None
     candidates: Optional[List[Dict[str, Any]]] = None
 
     model_config = ConfigDict(extra="ignore")
@@ -161,7 +177,7 @@ async def detect_location(req: DetectRequest):
        - Gọi content-service GET /locations/discover (bán kính 500m) để tìm bài viết từ Wikimedia (kèm cache)
        - Sau khi discover, gọi lại /locations/nearby và xét lại candidate kích hoạt
     4. Nếu có candidate kích hoạt (distance_m <= radius):
-       - Tuần 3: detected=True, narration_status='not_implemented', chưa gọi TTS
+       - Gọi Content /narrate, trả trạng thái chờ hoặc URL MP3 đã lưu.
     5. Nếu ngoài radius (khoảng cách > radius):
        - detected=False, reason='outside_activation_radius'
     6. Nếu không có địa điểm nào trong 500m:
@@ -270,43 +286,25 @@ async def detect_location(req: DetectRequest):
 
     # Có candidates nhưng kiểm tra activation
     if active_candidate:
-        # Nằm trong bán kính kích hoạt -> Gọi B /narrate
+        # Nằm trong bán kính kích hoạt -> Content điều phối thuyết minh
         dist = active_candidate.get("distance_m")
         source_url = active_candidate.get("source_url")
 
-        source_title = str(active_candidate.get("source_title") or active_candidate.get("name") or "Địa điểm").strip()
-        source_lang = active_candidate.get("source_lang") or "vi"
-        if source_lang not in ALLOWED_LANGS:
-            source_lang = "vi"
-        source_text = str(
-            active_candidate.get("description_source")
-            or active_candidate.get("description_vi")
-            or active_candidate.get("name")
-            or "Không có mô tả"
-        ).strip()
-        source_page_id = str(active_candidate.get("source_page_id") or "0")
-        if not source_page_id.lstrip("-").isdigit():
-            source_page_id = "0"
-
-        narrate_payload = {
-            "location_id": int(active_candidate["id"]),
-            "source_title": source_title,
-            "source_lang": source_lang,
-            "target_lang": req.language,
-            "source_text": source_text,
-            "source_page_id": source_page_id,
-            "source_url": source_url,
-        }
+        narrate_payload = {"location_id": int(active_candidate["id"]),
+                           "target_lang": req.language, "voice": req.voice}
 
         narrate_timeout = httpx.Timeout(GATEWAY_NARRATE_TIMEOUT, connect=5.0, read=GATEWAY_NARRATE_TIMEOUT)
+        narrate_start_time = time.time()
         try:
             async with httpx.AsyncClient(timeout=narrate_timeout) as narrate_client:
                 narrate_resp = await narrate_client.post(
-                    f"{TTS_SERVICE_URL}/narrate",
+                    f"{CONTENT_SERVICE_URL}/narrate",
                     json=narrate_payload,
                 )
         except (httpx.TimeoutException, httpx.RequestError) as exc:
-            # Lỗi mạng hoặc timeout từ B
+            # Ghi nhận lỗi và event thất bại
+            analytics_store.record_error_log("content-service", "POST /narrate", str(exc), 503, "NetworkError")
+            analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", status_reason="narrate_unavailable")
             return DetectResponse(
                 detected=True,
                 reason="narrate_unavailable",
@@ -322,14 +320,41 @@ async def detect_location(req: DetectRequest):
                 candidates=candidates,
             )
 
+        duration_ms = round((time.time() - narrate_start_time) * 1000, 1)
+
+        if narrate_resp.status_code == 202:
+            return DetectResponse(detected=True, location=active_candidate,
+                distance_m=round(dist, 1) if dist is not None else None,
+                requested_lang=req.language, narration_status="processing",
+                retry_after=10, source_url=source_url, candidates=candidates)
+
         if narrate_resp.status_code == 200:
             b_data = narrate_resp.json()
             raw_audio_url = b_data.get("audio_url")
             public_audio_url = None
-            if raw_audio_url:
+            if raw_audio_url and raw_audio_url.startswith("https://"):
+                public_audio_url = raw_audio_url  # URL ký bởi Content Service, phát thẳng từ Storage.
+            elif raw_audio_url:
                 # Đổi sang relative URL /audio/<filename>.mp3 cùng origin Gateway
                 audio_filename = b_data.get("audio_filename") or raw_audio_url.split("/")[-1]
                 public_audio_url = f"/audio/{audio_filename}"
+
+            # Ghi nhận analytics sự kiện kích hoạt địa điểm & thuyết minh thành công
+            analytics_store.record_location_event(
+                int(active_candidate["id"]),
+                str(active_candidate.get("name") or active_candidate.get("source_title") or ""),
+                req.language,
+                "activated",
+                distance_m=dist,
+            )
+            analytics_store.record_narration_event(
+                int(active_candidate["id"]),
+                req.language,
+                "tts_success",
+                duration_ms=duration_ms,
+                is_fallback=b_data.get("is_fallback", False),
+                status_reason=b_data.get("narration_status", "audio_ready"),
+            )
 
             return DetectResponse(
                 detected=True,
@@ -343,15 +368,19 @@ async def detect_location(req: DetectRequest):
                 source_url=b_data.get("source_url") or source_url,
                 is_fallback=b_data.get("is_fallback", False),
                 narration_status=b_data.get("narration_status", "audio_ready"),
+                cache_hit=b_data.get("cache_hit", False),
                 candidates=candidates,
             )
         else:
-            # B trả lỗi 4xx hoặc 5xx
+            # Content trả lỗi 4xx hoặc 5xx
             try:
                 err_data = narrate_resp.json()
                 detail = err_data.get("detail", narrate_resp.text)
             except Exception:
                 detail = narrate_resp.text
+
+            analytics_store.record_error_log("content-service", "POST /narrate", str(detail), narrate_resp.status_code, "UpstreamError")
+            analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", duration_ms=duration_ms, status_reason=str(detail)[:100])
 
             return DetectResponse(
                 detected=True,
@@ -582,3 +611,250 @@ async def debug_text_to_speech(req: DebugTTSRequest):
         # Đảm bảo audio_url là same-origin relative URL trên Gateway
         data["audio_url"] = f"/audio/{filename}"
     return data
+
+
+# ===========================================================================
+# Analytics Endpoints (Công khai, Nhẹ, Ẩn danh, Không IP / GPS)
+# ===========================================================================
+
+class HeartbeatPayload(BaseModel):
+    client_id: str
+
+
+class PageviewPayload(BaseModel):
+    client_id: str
+    path: Optional[str] = "/app/"
+
+
+@app.post("/analytics/heartbeat")
+async def client_heartbeat(payload: HeartbeatPayload, request: Request):
+    """
+    Tiếp nhận heartbeat ẩn danh mỗi 30s từ client.
+    Không lưu IP người dùng hay vị trí GPS.
+    """
+    ua = request.headers.get("user-agent", "")
+    analytics_store.record_heartbeat(payload.client_id, user_agent_short=ua)
+    return {"status": "ok"}
+
+
+@app.post("/analytics/pageview")
+async def client_pageview(payload: PageviewPayload):
+    """
+    Tiếp nhận sự kiện mở trang /app/ duy nhất.
+    """
+    analytics_store.record_page_view(payload.client_id, path=payload.path or "/app/")
+    return {"status": "ok"}
+
+
+# ===========================================================================
+# Admin Dashboard & Protected Management Routes
+# ===========================================================================
+
+ADMIN_BASE = admin_auth.ADMIN_PATH.rstrip("/")
+# ADMIN_BASE ví dụ: "/admin-dashboard" hoặc "/admin-xyz123"
+
+
+def _get_client_ip(request: Request) -> str:
+    """Lấy IP client (ưu tiên x-forwarded-for nếu qua proxy Render)."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _require_admin_session(request: Request) -> str:
+    """
+    Kiểm tra session cookie của Admin.
+    Nếu không hợp lệ -> raise HTTPException 401.
+    """
+    cookie_token = request.cookies.get(admin_auth.SESSION_COOKIE_NAME)
+    username = admin_auth.verify_session_token(cookie_token)
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Phiên đăng nhập quản trị không hợp lệ hoặc đã hết hạn",
+        )
+    return username
+
+
+@app.get(f"{ADMIN_BASE}", include_in_schema=False)
+@app.get(f"{ADMIN_BASE}/", include_in_schema=False)
+async def admin_entry(request: Request):
+    """
+    Trang chính Dashboard Quản Trị hoặc Form Đăng nhập.
+    Nếu chưa đăng nhập: Trả về trang login.
+    Nếu đã đăng nhập: Trả về giao diện Dashboard đầy đủ số liệu.
+    """
+    cookie_token = request.cookies.get(admin_auth.SESSION_COOKIE_NAME)
+    username = admin_auth.verify_session_token(cookie_token)
+
+    if not username:
+        # Chưa đăng nhập -> Render trang Login
+        return HTMLResponse(admin_view.render_login_page(admin_path=f"{ADMIN_BASE}/"))
+
+    # Đã đăng nhập -> Lấy dữ liệu tổng quan
+    summary = analytics_store.get_analytics_summary()
+    top_locs = analytics_store.get_top_locations(limit=10)
+    recent_errors = analytics_store.get_recent_error_logs(limit=25)
+
+    # Lấy thông tin thống kê từ Content Service & Downstream Health
+    locations_summary = {"total_locations": 0, "total_cached_narrations": 0}
+    downstream_health = {}
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        # Gọi content-service lấy tổng số địa điểm
+        try:
+            loc_resp = await client.get(f"{CONTENT_SERVICE_URL}/locations")
+            if loc_resp.is_success:
+                loc_list = loc_resp.json()
+                locations_summary["total_locations"] = len(loc_list)
+                locations_summary["total_cached_narrations"] = sum(1 for l in loc_list if l.get("is_ready"))
+            downstream_health["content-service"] = {"status": "ok"} if loc_resp.is_success else {"status": "error"}
+        except Exception as e:
+            downstream_health["content-service"] = {"status": "error", "message": str(e)}
+
+        # Gọi translate-audio-service health
+        try:
+            tts_resp = await client.get(f"{TTS_SERVICE_URL}/health")
+            downstream_health["translate-audio-service"] = tts_resp.json() if tts_resp.is_success else {"status": "error"}
+        except Exception as e:
+            downstream_health["translate-audio-service"] = {"status": "error", "message": str(e)}
+
+    return HTMLResponse(
+        admin_view.render_dashboard_page(
+            admin_path=f"{ADMIN_BASE}/",
+            summary=summary,
+            top_locations=top_locs,
+            recent_errors=recent_errors,
+            locations_summary=locations_summary,
+            downstream_health=downstream_health,
+            username=username,
+        )
+    )
+
+
+@app.post(f"{ADMIN_BASE}/login", include_in_schema=False)
+async def admin_login(request: Request):
+    """
+    Xử lý đăng nhập Quản trị viên.
+    - Đọc urlencoded form an toàn từ request body (zero external dependencies).
+    - Kiểm tra Brute-force rate limiting theo IP.
+    - So sánh an toàn thời gian hằng số với ADMIN_USERNAME & ADMIN_PASSWORD.
+    - Tạo Session cookie có thuộc tính HttpOnly, SameSite=Lax.
+    """
+    from urllib.parse import parse_qs
+
+    body_bytes = await request.body()
+    parsed = parse_qs(body_bytes.decode("utf-8", errors="ignore"))
+    username = (parsed.get("username", [""])[0]).strip()
+    password = parsed.get("password", [""])[0]
+    client_ip = _get_client_ip(request)
+
+    if not admin_auth.check_rate_limit(client_ip):
+        # Đang bị khóa do thử sai quá nhiều
+        return HTMLResponse(
+            admin_view.render_login_page(
+                admin_path=f"{ADMIN_BASE}/",
+                error_message="Quá nhiều lần đăng nhập sai. Vui lòng thử lại sau 5 phút.",
+                username=username,
+            ),
+            status_code=429,
+        )
+
+    # Kiểm tra tài khoản & mật khẩu
+    valid_user = (username.strip() == admin_auth.ADMIN_USERNAME)
+    valid_pass = False
+
+    # Nếu ADMIN_PASSWORD chưa được set (môi trường mới chưa cấu hình)
+    if not admin_auth.ADMIN_PASSWORD:
+        return HTMLResponse(
+            admin_view.render_login_page(
+                admin_path=f"{ADMIN_BASE}/",
+                error_message="Hệ thống chưa được cấu hình ADMIN_PASSWORD trong biến môi trường Render.",
+                username=username,
+            ),
+            status_code=500,
+        )
+
+    valid_pass = admin_auth.verify_password(password, admin_auth.ADMIN_PASSWORD)
+
+    if not (valid_user and valid_pass):
+        admin_auth.record_failed_attempt(client_ip)
+        analytics_store.record_error_log("gateway-service", "ADMIN_LOGIN_FAIL", f"Đăng nhập thất bại cho user: {username}", 401, "AuthFailure")
+        return HTMLResponse(
+            admin_view.render_login_page(
+                admin_path=f"{ADMIN_BASE}/",
+                error_message="Tên đăng nhập hoặc mật khẩu quản trị không chính xác.",
+                username=username,
+            ),
+            status_code=401,
+        )
+
+    # Đăng nhập thành công -> Reset số lần thử sai
+    admin_auth.reset_failed_attempts(client_ip)
+    token = admin_auth.create_session_token(username.strip())
+
+    # Chuyển hướng về Dashboard và set Cookie phiên
+    resp = RedirectResponse(url=f"{ADMIN_BASE}/", status_code=status.HTTP_302_FOUND)
+    # Xác định cờ Secure nếu đang chạy qua HTTPS (Render proxy có x-forwarded-proto)
+    is_https = request.headers.get("x-forwarded-proto") == "https" or request.url.scheme == "https"
+    resp.set_cookie(
+        key=admin_auth.SESSION_COOKIE_NAME,
+        value=token,
+        max_age=admin_auth.SESSION_MAX_AGE_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+        path="/",
+    )
+    return resp
+
+
+@app.get(f"{ADMIN_BASE}/logout", include_in_schema=False)
+async def admin_logout():
+    """Đăng xuất quản trị viên và xóa cookie phiên."""
+    resp = RedirectResponse(url=f"{ADMIN_BASE}/", status_code=status.HTTP_302_FOUND)
+    resp.delete_cookie(key=admin_auth.SESSION_COOKIE_NAME, path="/")
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Các API Thống kê Quản trị (Bảo vệ bằng Session Token)
+# ---------------------------------------------------------------------------
+
+@app.get(f"{ADMIN_BASE}/api/summary")
+async def admin_api_summary(request: Request):
+    """API trả về các chỉ số KPI tóm tắt cho dashboard polling."""
+    _require_admin_session(request)
+    summary = analytics_store.get_analytics_summary()
+    return summary
+
+
+@app.get(f"{ADMIN_BASE}/api/chart")
+async def admin_api_chart(request: Request, days: int = 7):
+    """API dữ liệu biểu đồ hoạt động theo 1, 7, hoặc 30 ngày."""
+    _require_admin_session(request)
+    if days not in (1, 7, 30):
+        days = 7
+    return analytics_store.get_activity_chart_data(days=days)
+
+
+@app.get(f"{ADMIN_BASE}/api/locations")
+async def admin_api_locations(request: Request):
+    """API lấy danh mục địa điểm từ Content Service để quản trị viên tra cứu."""
+    _require_admin_session(request)
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            resp = await client.get(f"{CONTENT_SERVICE_URL}/locations")
+            if resp.is_success:
+                return resp.json()
+            raise HTTPException(status_code=resp.status_code, detail="Lỗi từ Content Service")
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=503, detail=f"Không thể kết nối Content Service: {exc}")
+
+
+@app.get(f"{ADMIN_BASE}/api/errors")
+async def admin_api_errors(request: Request, limit: int = 50):
+    """API xem danh sách lỗi hệ thống (đã làm sạch)."""
+    _require_admin_session(request)
+    return analytics_store.get_recent_error_logs(limit=min(limit, 100))

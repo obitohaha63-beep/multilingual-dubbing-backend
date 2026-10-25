@@ -1,0 +1,168 @@
+{
+  "environment": "Local Windows, SQLite; mocked Wikimedia/Gemini/TTS/Storage; no HTTP Gateway or Render",
+  "api_latency": "zero; does not model upstream latency or quota",
+  "results": [
+    {
+      "mode": "cache_hit",
+      "users": 5,
+      "first_response_p50_ms": 2.69,
+      "first_response_p95_ms": 3.23,
+      "completion_p50_ms": 2.69,
+      "wall_seconds": 0.005,
+      "peak_rss_mb": 68.49,
+      "cpu_one_core_percent": 0.0,
+      "errors": 0,
+      "initial_cache_hit_ratio": 1.0,
+      "external_calls": {
+        "wiki": 0,
+        "gemini": 0,
+        "tts": 0,
+        "upload": 0
+      }
+    },
+    {
+      "mode": "new_same",
+      "users": 5,
+      "first_response_p50_ms": 23.95,
+      "first_response_p95_ms": 25.47,
+      "completion_p50_ms": 25.47,
+      "wall_seconds": 0.037,
+      "peak_rss_mb": 69.75,
+      "cpu_one_core_percent": 42.74,
+      "errors": 0,
+      "initial_cache_hit_ratio": 0.8,
+      "external_calls": {
+        "wiki": 1,
+        "gemini": 1,
+        "tts": 1,
+        "upload": 1
+      }
+    },
+    {
+      "mode": "new_distinct",
+      "users": 5,
+      "first_response_p50_ms": 18.32,
+      "first_response_p95_ms": 18.42,
+      "completion_p50_ms": 80.86,
+      "wall_seconds": 0.143,
+      "peak_rss_mb": 70.38,
+      "cpu_one_core_percent": 76.34,
+      "errors": 0,
+      "initial_cache_hit_ratio": 0.0,
+      "external_calls": {
+        "wiki": 5,
+        "gemini": 5,
+        "tts": 5,
+        "upload": 5
+      }
+    },
+    {
+      "mode": "cache_hit",
+      "users": 10,
+      "first_response_p50_ms": 5.96,
+      "first_response_p95_ms": 7.09,
+      "completion_p50_ms": 5.96,
+      "wall_seconds": 0.009,
+      "peak_rss_mb": 70.4,
+      "cpu_one_core_percent": 168.1,
+      "errors": 0,
+      "initial_cache_hit_ratio": 1.0,
+      "external_calls": {
+        "wiki": 0,
+        "gemini": 0,
+        "tts": 0,
+        "upload": 0
+      }
+    },
+    {
+      "mode": "new_same",
+      "users": 10,
+      "first_response_p50_ms": 17.7,
+      "first_response_p95_ms": 40.35,
+      "completion_p50_ms": 41.33,
+      "wall_seconds": 0.046,
+      "peak_rss_mb": 71.26,
+      "cpu_one_core_percent": 101.72,
+      "errors": 0,
+      "initial_cache_hit_ratio": 0.2,
+      "external_calls": {
+        "wiki": 1,
+        "gemini": 1,
+        "tts": 1,
+        "upload": 1
+      }
+    },
+    {
+      "mode": "new_distinct",
+      "users": 10,
+      "first_response_p50_ms": 13.81,
+      "first_response_p95_ms": 13.98,
+      "completion_p50_ms": 231.12,
+      "wall_seconds": 0.337,
+      "peak_rss_mb": 71.81,
+      "cpu_one_core_percent": 64.96,
+      "errors": 0,
+      "initial_cache_hit_ratio": 0.0,
+      "external_calls": {
+        "wiki": 10,
+        "gemini": 10,
+        "tts": 10,
+        "upload": 10
+      }
+    },
+    {
+      "mode": "cache_hit",
+      "users": 20,
+      "first_response_p50_ms": 9.36,
+      "first_response_p95_ms": 15.24,
+      "completion_p50_ms": 9.36,
+      "wall_seconds": 0.016,
+      "peak_rss_mb": 72.81,
+      "cpu_one_core_percent": 94.77,
+      "errors": 0,
+      "initial_cache_hit_ratio": 1.0,
+      "external_calls": {
+        "wiki": 0,
+        "gemini": 0,
+        "tts": 0,
+        "upload": 0
+      }
+    },
+    {
+      "mode": "new_same",
+      "users": 20,
+      "first_response_p50_ms": 59.11,
+      "first_response_p95_ms": 72.71,
+      "completion_p50_ms": 59.11,
+      "wall_seconds": 0.079,
+      "peak_rss_mb": 73.4,
+      "cpu_one_core_percent": 59.56,
+      "errors": 0,
+      "initial_cache_hit_ratio": 0.85,
+      "external_calls": {
+        "wiki": 1,
+        "gemini": 1,
+        "tts": 1,
+        "upload": 1
+      }
+    },
+    {
+      "mode": "new_distinct",
+      "users": 20,
+      "first_response_p50_ms": 18.02,
+      "first_response_p95_ms": 18.26,
+      "completion_p50_ms": 311.98,
+      "wall_seconds": 0.584,
+      "peak_rss_mb": 74.74,
+      "cpu_one_core_percent": 48.13,
+      "errors": 0,
+      "initial_cache_hit_ratio": 0.0,
+      "external_calls": {
+        "wiki": 20,
+        "gemini": 20,
+        "tts": 20,
+        "upload": 20
+      }
+    }
+  ]
+}

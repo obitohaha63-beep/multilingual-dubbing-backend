@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math, os, re, shutil, sqlite3, time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -14,7 +15,9 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import Base, DB_PATH, Location, NarrationCache, SessionLocal, engine
+from models import Base, DB_PATH, IS_SQLITE, Location, Narration, NarrationCache, SessionLocal, engine
+from narration_clients import PipelineError
+from narration_pipeline import NarrationPipeline
 
 # ============ 1. MIGRATION (create_all không tự thêm cột vào bảng cũ) ============
 NEW_COLUMNS = [("description_source", "TEXT"), ("latitude", "REAL"), ("longitude", "REAL"),
@@ -319,10 +322,13 @@ def _find_narration(db: Session, location_id: int, requested_lang: str):
 def _ready_languages(db: Session, location_id: int) -> list:
     """Các ngôn ngữ audio_ready còn hạn."""
     db.flush()  # session autoflush=False -> flush tay để đọc đúng
-    return list(db.execute(select(NarrationCache.requested_lang).where(
+    old = list(db.execute(select(NarrationCache.requested_lang).where(
         NarrationCache.location_id == location_id,
         NarrationCache.audio_status == "audio_ready",
         NarrationCache.expires_at > utcnow()).order_by(NarrationCache.requested_lang)).scalars())
+    durable = db.execute(select(Narration.language).where(
+        Narration.location_id == location_id, Narration.status == "ready")).scalars()
+    return sorted(set(old) | set(durable))
 
 
 def _recompute_is_ready(db: Session, location: Location) -> bool:
@@ -337,9 +343,24 @@ def _invalidate_narrations(db: Session, location: Location) -> None:
 
 
 # ============ 5. FASTAPI APP + ROUTES ============
-app = FastAPI(title="content-service")
-run_migrations()                       # DB cũ (tuần 2)
-Base.metadata.create_all(bind=engine)  # DB mới hoàn toàn
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    # Khi dừng service, checkpoint giữ trong DB; request sau lấy lại lease hết hạn.
+    import asyncio
+    tasks = list(narration_pipeline.tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await narration_pipeline.close()
+
+
+app = FastAPI(title="content-service", lifespan=lifespan)
+if IS_SQLITE:  # Local/test cũ; Supabase phải chạy SQL migration trước khi deploy.
+    run_migrations()
+    Base.metadata.create_all(bind=engine)
+narration_pipeline = NarrationPipeline()
 
 
 def get_db():
@@ -507,10 +528,42 @@ def update_location(location_id: int, body: LocationCreate, db: Session = Depend
 @app.delete("/locations/{location_id}")
 def delete_location(location_id: int, db: Session = Depends(get_db)):
     loc = _get_location_or_404(db, location_id)
+    if db.execute(select(Narration.id).where(Narration.location_id == location_id).limit(1)).first():
+        raise HTTPException(409, "Địa điểm đã có thuyết minh lưu lâu dài; giữ lại để bảo toàn dữ liệu")
     db.execute(delete(NarrationCache).where(NarrationCache.location_id == location_id))
     db.delete(loc)
     db.commit()
     return {"deleted": True, "id": location_id}
+
+
+class GenerateNarrationRequest(BaseModel):
+    location_id: int = Field(gt=0)
+    target_lang: str
+    voice: Optional[str] = None
+
+
+@app.post("/narrate")
+async def generate_narration(body: GenerateNarrationRequest):
+    """Client gọi lại qua detect mỗi 10s khi nhận HTTP 202."""
+    import asyncio
+    from sqlalchemy.exc import SQLAlchemyError
+    _check_language(body.target_lang)
+    if IS_SQLITE or not narration_pipeline.clients.configured():
+        raise HTTPException(503, "Cần cấu hình DATABASE_URL PostgreSQL, Gemini và Supabase Storage")
+
+    def load_location():
+        with SessionLocal() as db:
+            return LocationResponse.model_validate(_get_location_or_404(db, body.location_id)).model_dump(mode="json")
+
+    try:
+        location = await asyncio.to_thread(load_location)
+        result = await narration_pipeline.request(location, body.target_lang, body.voice)
+        code = 200 if result["narration_status"] == "audio_ready" else 503 if result["narration_status"] == "error" else 202
+        return JSONResponse(status_code=code, content=result, headers={"Retry-After": "10"})
+    except PipelineError as exc:
+        raise HTTPException(422 if str(exc) == "invalid_voice" else 503, str(exc)) from exc
+    except (SQLAlchemyError, httpx.RequestError):
+        raise HTTPException(503, "narration_storage_unavailable")
 
 
 # --- Narration cache + is_ready ---
