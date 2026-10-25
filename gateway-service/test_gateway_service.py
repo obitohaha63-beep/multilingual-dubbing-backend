@@ -35,6 +35,25 @@ from main import app, DetectRequest, DetectResponse
 client = TestClient(app)
 
 
+@pytest.mark.parametrize("pending", [True, False])
+def test_detect_calls_content_and_preserves_signed_storage_url(pending):
+    from main import CONTENT_SERVICE_URL
+    place = {"id": 1, "name": "Chợ", "radius": 80, "distance_m": 10}
+    signed = "https://project.supabase.co/storage/v1/object/sign/bucket/file.mp3?token=test"
+    content = httpx.Response(202 if pending else 200, json={
+        "narration_status": "processing" if pending else "audio_ready",
+        "audio_url": None if pending else signed, "requested_lang": "vi", "cache_hit": not pending})
+    nearby = httpx.Response(200, json={"candidates": [place]})
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=nearby), \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=content) as post:
+        result = client.post("/locations/detect", json={"latitude": 10, "longitude": 106, "language": "vi"})
+    data = result.json()
+    assert post.call_args.args[0] == f"{CONTENT_SERVICE_URL}/narrate"
+    assert data["narration_status"] == ("processing" if pending else "audio_ready")
+    assert data["audio_url"] == (None if pending else signed)
+    assert data["cache_hit"] is (not pending)
+
+
 # ===========================================================================
 # 1. Health & Legacy Preview & Route conflicts
 # ===========================================================================

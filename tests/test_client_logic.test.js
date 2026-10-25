@@ -13,6 +13,26 @@ const {
   TourStateManager,
 } = require(path.resolve(__dirname, "../gateway-service/client/app.js"));
 
+describe("Chờ tạo thuyết minh trên Content Service", () => {
+  it("processing/error không phát mô tả nguồn; ready sau đó phát một lần", () => {
+    const manager = new TourStateManager();
+    const response = { detected: true, location: { id: 1, latitude: 10, longitude: 106 },
+      requested_lang: "vi", narration_status: "processing" };
+    const context = manager.prepareRequest();
+    assert.equal(manager.handleDetectResponse(response, context.token, "vi").action, "wait_generation");
+    assert.equal(manager.narrationState, "idle");
+    assert.equal(manager.playedKeys.size, 0);
+    response.narration_status = "error";
+    assert.equal(manager.handleDetectResponse(response, context.token, "vi").action, "generation_error");
+    response.narration_status = "audio_ready";
+    response.audio_url = "https://example.supabase.co/audio.mp3";
+    const result = manager.handleDetectResponse(response, context.token, "vi");
+    assert.equal(result.action, "play");
+    manager.markPlaybackStarted(result.key);
+    assert.equal(manager.handleDetectResponse(response, context.token, "vi").action, "skip_already_played");
+  });
+});
+
 describe("Client State Machine & Core Flow (Tuần 5)", () => {
   let manager;
 

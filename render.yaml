@@ -3,7 +3,7 @@ services:
     type: web
     runtime: docker
     repo: https://github.com/obitohaha63-beep/multilingual-dubbing-backend
-    branch: main
+    branch: cong-thanh
     dockerfilePath: ./render.Dockerfile
     # Render build tu root cua repo, context la thu muc goc
     dockerContext: .
@@ -12,12 +12,36 @@ services:
     healthCheckPath: /health
     # Bien moi truong bat buoc - phai dien gia tri thuc trong Render Dashboard
     envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: "gemini-3.5-flash-lite"
+      - key: SUPABASE_AUDIO_BUCKET
+        value: "narration-audio"
+      - key: CONTENT_VERSION
+        value: "v1"
+      - key: NARRATION_MAX_CONCURRENT
+        value: "2"
+      - key: NARRATION_TARGET_CHARS
+        value: "900"
+      - key: TTS_MAX_CONCURRENT
+        value: "2"
       # --- Cau hinh Wikimedia ---
       - key: WIKIMEDIA_USER_AGENT
         # Vi du: "ten-ung-dung/1.0 (email@example.com)"
         # Khong duoc de trong - Wikimedia yeu cau User-Agent ro rang
         value: multilingual-dubbing/1.0 (contact@example.com)
       # --- Cau hinh TTS ---
+      - key: GOOGLE_TTS_API_KEY
+        sync: false
+      - key: TTS_PROVIDER_VI
+        value: "google"
       - key: TTS_TIMEOUT_SECONDS
         value: "25.0"
       - key: TTS_CONFIG_VERSION

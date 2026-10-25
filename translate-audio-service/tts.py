@@ -36,13 +36,22 @@ import hashlib
 import logging
 import os
 import re
+import time
 import uuid
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import edge_tts
+import httpx
+from aiohttp import ClientConnectionError, ClientResponseError, WSServerHandshakeError
+from gtts import gTTS
+from mutagen.mp3 import MP3
+from mutagen import MutagenError
 
-logger = logging.getLogger("translate_audio.tts")
+EDGE_TTS_VERSION: str = getattr(edge_tts, "__version__", "unknown")
+logger = logging.getLogger("uvicorn.error.translate_audio.tts")
+VI_VOICES = ("vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural")
 
 # Danh sách ngôn ngữ được hỗ trợ
 ALLOWED_LANGS = {"vi", "en", "ja"}
@@ -89,7 +98,11 @@ class UnsupportedLanguageError(Exception):
 class TTSError(Exception):
     """Ngoại lệ khi quá trình chuyển văn bản thành giọng nói gặp lỗi."""
 
-    pass
+    def __init__(self, message, *, cause=None, retryable=False, attempts=None):
+        super().__init__(message)
+        self.cause = cause
+        self.retryable = retryable
+        self.attempts = attempts or []
 
 
 class TTSTimeoutError(TTSError):
@@ -115,8 +128,10 @@ def normalize_tts_text(text: str) -> str:
     """
     Chuẩn hóa khoảng trắng của text: thu gọn khoảng trắng liên tiếp và cắt viền.
     """
-    if not text:
-        return ""
+    if not isinstance(text, str):
+        raise ValueError("text phải là chuỗi")
+    if any(unicodedata.category(c) in {"Cc", "Cs"} and c not in "\r\n\t" for c in text):
+        raise ValueError("text chứa ký tự điều khiển không hợp lệ")
     return _MULTI_WHITESPACE.sub(" ", text).strip()
 
 
@@ -156,6 +171,109 @@ def validate_audio_filename(filename: str) -> bool:
     return bool(SAFE_AUDIO_FILENAME_RE.match(filename))
 
 
+def is_valid_mp3_file(filepath: Path) -> bool:
+    """
+    Xác minh file âm thanh tồn tại trên đĩa và có dữ liệu MP3 hợp lệ:
+    - Kích thước > 0 bytes.
+    - Bắt đầu bằng ID3 tag (ID3v2) hoặc MPEG audio frame sync bits (0xFF, 0xE0).
+    """
+    if not filepath.is_file():
+        return False
+    try:
+        size = filepath.stat().st_size
+        if not 128 <= size <= 2_000_000:
+            return False
+        info = MP3(filepath).info
+        return not info.sketchy and info.length > 0 and info.sample_rate > 0 and info.channels in {1, 2}
+    except (OSError, MutagenError, ValueError):
+        return False
+
+
+_catalog_names = None
+_catalog_until = 0.0
+_catalog_lock = asyncio.Lock()
+
+
+async def available_voice_names():
+    """Best effort catalog, cached for an hour (failed fetches for one minute)."""
+    global _catalog_names, _catalog_until
+    if time.monotonic() < _catalog_until:
+        return _catalog_names
+    async with _catalog_lock:
+        if time.monotonic() < _catalog_until:
+            return _catalog_names
+        try:
+            voices = await asyncio.wait_for(edge_tts.list_voices(), timeout=2)
+            _catalog_names = {v["ShortName"] for v in voices}
+            _catalog_until = time.monotonic() + 3600
+            logger.info("Edge catalog connected=true voice_count=%d edge_tts_version=%s",
+                        len(_catalog_names), EDGE_TTS_VERSION)
+        except Exception as exc:
+            _catalog_names = None
+            _catalog_until = time.monotonic() + 60
+            kind, status, _ = classify_error(exc)
+            logger.warning("Edge catalog connected=false category=%s error_type=%s http_status=%s",
+                           kind, type(exc).__name__, status)
+        return _catalog_names
+
+
+def classify_error(exc):
+    status = getattr(exc, "status", None)
+    if isinstance(exc, edge_tts.exceptions.NoAudioReceived):
+        return "no_audio", status, True
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout", status, True
+    if isinstance(exc, WSServerHandshakeError):
+        return "websocket", status, status in {429, 500, 502, 503, 504}
+    if isinstance(exc, edge_tts.exceptions.WebSocketError):
+        return "websocket", status, True
+    if isinstance(exc, ClientResponseError):
+        return "http", status, status in {429, 500, 502, 503, 504}
+    if isinstance(exc, (ClientConnectionError, ConnectionError)):
+        return "network", status, True
+    return "invalid_audio" if isinstance(exc, TTSError) else "fixed_error", status, False
+
+
+async def synthesize_google_cloud_tts(text: str, voice_name: str, filepath: Path, timeout: float = 10.0) -> bool:
+    """Gọi Google Cloud Text-to-Speech API chính thức qua HTTP REST.
+
+    Sử dụng GOOGLE_TTS_API_KEY.
+    """
+    api_key = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
+    if not api_key:
+        return False
+    url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={api_key}"
+    payload = {
+        "input": {"text": text},
+        "voice": {"languageCode": "vi-VN", "name": voice_name if "Neural" in voice_name or "Wavenet" in voice_name else "vi-VN-Neural2-A"},
+        "audioConfig": {"audioEncoding": "MP3", "speakingRate": 1.0},
+    }
+    import base64
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload)
+        if resp.status_code == 200:
+            audio_content = resp.json().get("audioContent")
+            if audio_content:
+                filepath.write_bytes(base64.b64decode(audio_content))
+                return True
+        logger.warning("Google Cloud TTS error: status=%d, detail=%s", resp.status_code, resp.text[:200])
+        return False
+
+
+async def synthesize_gtts(text: str, filepath: Path) -> bool:
+    """Tạo âm thanh tiếng Việt bằng gTTS (Google Translate TTS). Miễn phí không giới hạn, nhanh và ổn định."""
+    def _run():
+        tts_obj = gTTS(text=text, lang="vi", tld="com.vn")
+        tts_obj.save(str(filepath))
+    try:
+        await asyncio.to_thread(_run)
+        return True
+    except Exception as exc:
+        logger.warning("gTTS synthesis failed: %s", exc)
+        return False
+
+
+
 # ---------------------------------------------------------------------------
 # Khóa đồng bộ theo Key (Concurrency Lock Manager)
 # ---------------------------------------------------------------------------
@@ -192,139 +310,156 @@ async def synthesize_speech(
     lang: str,
     audio_dir: Optional[Path] = None,
     timeout_seconds: Optional[float] = None,
+    voice: Optional[str] = None,
+    allow_fallback: bool = True,
 ) -> Dict[str, Any]:
+    """At most three new Edge sessions; Vietnamese no-audio switches voices immediately.
+
+    save() consumes the complete Edge audio stream. Only a parsed MP3 with positive
+    duration is published, using atomic rename. Failed/cancelled temporary files go away.
     """
-    Tạo file MP3 từ văn bản qua Edge TTS hoặc trả về cache có sẵn.
-
-    Tham số:
-    - text: nội dung văn bản (tối đa 1200 ký tự)
-    - lang: mã ngôn ngữ thật của text ('vi', 'en', 'ja')
-    - audio_dir: thư mục lưu file (mặc định lấy theo cấu hình AUDIO_DIR)
-    - timeout_seconds: thời gian chờ tối đa khi gọi TTS (mặc định TTS_TIMEOUT_SECONDS)
-
-    Trả về:
-    {
-        "lang": str,
-        "voice": str,
-        "text_hash": str,
-        "audio_filename": str,
-        "audio_url": str,
-        "cache_hit": bool,
-    }
-    """
-    target_dir = ensure_audio_dir(audio_dir)
-    timeout = (
-        timeout_seconds if timeout_seconds is not None else TTS_TIMEOUT_SECONDS
-    )
-
-    # 1. Kiểm tra ngôn ngữ
     lang_clean = lang.strip().lower()
     if lang_clean not in ALLOWED_LANGS:
         raise UnsupportedLanguageError(lang_clean)
-
-    # 2. Chuẩn hóa và kiểm tra độ dài text
     normalized_text = normalize_tts_text(text)
-    if not normalized_text:
-        raise ValueError("text không được để trống")
+    if not normalized_text or not any(c.isalpha() for c in normalized_text):
+        raise ValueError("text phải có nội dung có thể đọc")
     if len(normalized_text) > MAX_TEXT_LENGTH:
-        raise ValueError(
-            f"text không được vượt quá {MAX_TEXT_LENGTH} ký tự "
-            f"(nhận {len(normalized_text)} ký tự)"
-        )
-
-    voice = get_voice_for_lang(lang_clean)
+        raise ValueError(f"text không được vượt quá {MAX_TEXT_LENGTH} ký tự")
+    default_voice = get_voice_for_lang(lang_clean).strip()
+    allowed = {default_voice, *os.getenv(f"TTS_ALLOWED_VOICES_{lang_clean.upper()}", "").split(",")}
+    if lang_clean == "vi":
+        allowed.update(VI_VOICES)
+    requested_voice = voice or default_voice
+    if requested_voice not in allowed or not requested_voice.startswith(lang_clean + "-"):
+        raise ValueError("Giọng đọc không thuộc danh sách cho phép của ngôn ngữ")
+    candidates = [requested_voice]
+    if lang_clean == "vi" and allow_fallback:
+        candidates.extend(v for v in VI_VOICES if v != requested_voice)
+    target_dir = ensure_audio_dir(audio_dir)
+    timeout = timeout_seconds if timeout_seconds is not None else TTS_TIMEOUT_SECONDS
     text_hash = compute_text_hash(normalized_text)
-    cache_key = compute_cache_key(
-        normalized_text, lang_clean, voice, TTS_CONFIG_VERSION
-    )
-    filename = f"{cache_key}.mp3"
-    filepath = target_dir / filename
+    # Both Vietnamese preferences share one lock; cache files retain the actual voice.
+    lock_voice = "vi-fallback-v1" if lang_clean == "vi" and allow_fallback else requested_voice
+    key_lock = await get_key_lock(compute_cache_key(normalized_text, lang_clean, lock_voice))
+    attempts = []
 
-    # An toàn thông tin: không log text nhạy cảm, chỉ log siêu dữ liệu
-    logger.info(
-        "Xử lý TTS: lang=%s, voice=%s, text_hash=%s, text_len=%d",
-        lang_clean,
-        voice,
-        text_hash,
-        len(normalized_text),
-    )
+    def result(actual_voice, filename, cached):
+        return {"lang": lang_clean, "voice": actual_voice, "requested_voice": requested_voice,
+                "voice_fallback": actual_voice != requested_voice, "text_hash": text_hash,
+                "audio_filename": filename, "audio_url": f"/audio/{filename}",
+                "cache_hit": cached, "attempts": attempts}
 
-    # 3. Đồng bộ hóa các request đồng thời vào cùng một key
-    key_lock = await get_key_lock(cache_key)
     async with key_lock:
-        # Kiểm tra file cache bền vững trên đĩa: phải tồn tại và kích thước > 0
-        if filepath.is_file() and filepath.stat().st_size > 0:
-            logger.info("Cache hit cho file audio: %s", filename)
-            return {
-                "lang": lang_clean,
-                "voice": voice,
-                "text_hash": text_hash,
-                "audio_filename": filename,
-                "audio_url": f"/audio/{filename}",
-                "cache_hit": True,
-            }
+        for candidate in candidates:
+            filename = compute_cache_key(normalized_text, lang_clean, candidate) + ".mp3"
+            if is_valid_mp3_file(target_dir / filename):
+                logger.info("TTS cache_hit=true voice=%s requested_voice=%s text_hash=%s",
+                            candidate, requested_voice, text_hash)
+                return result(candidate, filename, True)
 
-        # Nếu file chưa tồn tại hoặc bị xóa/hỏng -> tạo mới (không trả cache_hit giả)
-        logger.info(
-            "Cache miss (hoặc file vật lý bị mất), bắt đầu tạo audio: %s",
-            filename,
-        )
+        # Cơ chế tạo âm thanh:
+        # Nếu TTS_PROVIDER_VI="google" (mặc định cho tiếng Việt), dùng Google Cloud / gTTS để đảm bảo 100% không bị lỗi WebSocket NoAudioReceived trên Render.
+        # Nếu TTS_PROVIDER_VI="edge", ưu tiên Edge TTS và tự động fallback sang gTTS nếu Edge gặp sự cố.
+        provider_vi = os.getenv("TTS_PROVIDER_VI", "google").lower()
+        if lang_clean == "vi" and provider_vi != "edge" and not os.getenv("DISABLE_GTTS_FALLBACK"):
+            actual_voice = requested_voice
+            filename = compute_cache_key(normalized_text, lang_clean, actual_voice) + ".mp3"
+            filepath = target_dir / filename
+            temp_file = target_dir / f"tmp_{uuid.uuid4().hex}.tmp"
+            started = time.monotonic()
+            try:
+                success = await synthesize_google_cloud_tts(normalized_text, actual_voice, temp_file, timeout=timeout)
+                if not success or not is_valid_mp3_file(temp_file):
+                    success = await synthesize_gtts(normalized_text, temp_file)
 
-        # Atomic write: ghi ra file tạm trong cùng thư mục rồi đổi tên
-        temp_file = target_dir / f"tmp_{cache_key}_{uuid.uuid4().hex}.tmp"
-        try:
-            communicate = edge_tts.Communicate(normalized_text, voice)
-            await asyncio.wait_for(
-                communicate.save(str(temp_file)),
-                timeout=timeout,
-            )
+                if success and is_valid_mp3_file(temp_file):
+                    size = temp_file.stat().st_size
+                    os.replace(temp_file, filepath)
+                    duration_ms = round((time.monotonic() - started) * 1000, 1)
+                    entry = {"voice": actual_voice, "attempt": 1, "status": "success",
+                             "duration_ms": duration_ms, "bytes": size}
+                    attempts.append(entry)
+                    logger.info("Vietnamese TTS success: voice=%s duration_ms=%.1f bytes=%d text_len=%d text_hash=%s",
+                                actual_voice, duration_ms, size, len(normalized_text), text_hash)
+                    return result(actual_voice, filename, False)
+            except Exception as exc:
+                logger.warning("Google/gTTS Vietnamese synthesis failed, trying Edge fallback: %s", exc)
+            finally:
+                temp_file.unlink(missing_ok=True)
 
-            if not temp_file.is_file() or temp_file.stat().st_size == 0:
-                raise TTSError(
-                    "File âm thanh sau khi tạo bị rỗng hoặc không tồn tại"
-                )
+        # Với tiếng Anh (en), tiếng Nhật (ja) — hoặc khi chỉ định Edge cho tiếng Việt:
+        # Sử dụng Microsoft Edge TTS trực tuyến
+        if lang_clean == "vi":
+            names = await available_voice_names()
+            if names is not None:
+                candidates = [v for v in candidates if v in names]
+                if not candidates:
+                    raise TTSError("Không có giọng tiếng Việt yêu cầu trong danh sách Edge hiện tại",
+                                   cause="VoiceUnavailable")
 
-            # Atomic rename (trên cùng filesystem)
-            os.replace(temp_file, filepath)
+        index = 0
+        max_attempts = 3 if allow_fallback else 1
+        for attempt in range(1, max_attempts + 1):
+            actual_voice = candidates[index]
+            filename = compute_cache_key(normalized_text, lang_clean, actual_voice) + ".mp3"
+            filepath = target_dir / filename
+            temp_file = target_dir / f"tmp_{uuid.uuid4().hex}.tmp"
+            started = time.monotonic()
+            try:
+                communicate = edge_tts.Communicate(normalized_text, actual_voice)
+                await asyncio.wait_for(communicate.save(str(temp_file)), timeout=timeout)
+                if not is_valid_mp3_file(temp_file):
+                    raise TTSError("Edge trả dữ liệu không phải MP3 đọc được", cause="InvalidMP3")
+                size = temp_file.stat().st_size
+                os.replace(temp_file, filepath)
+                entry = {"voice": actual_voice, "attempt": attempt, "status": "success",
+                         "duration_ms": round((time.monotonic() - started) * 1000, 1), "bytes": size}
+                attempts.append(entry)
+                logger.info("Edge attempt=%d/%d voice=%s requested_voice=%s edge_tts_version=%s "
+                            "status=success duration_ms=%.1f bytes=%d text_len=%d text_hash=%s",
+                            attempt, max_attempts, actual_voice, requested_voice, EDGE_TTS_VERSION,
+                            entry["duration_ms"], size, len(normalized_text), text_hash)
+                return result(actual_voice, filename, False)
+            except Exception as exc:
+                kind, status, transient = classify_error(exc)
+                entry = {"voice": actual_voice, "attempt": attempt, "status": "failed",
+                         "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                         "error_type": type(exc).__name__, "category": kind, "http_status": status}
+                attempts.append(entry)
+                logger.warning("Edge attempt=%d/%d voice=%s edge_tts_version=%s category=%s "
+                               "error_type=%s http_status=%s duration_ms=%.1f text_len=%d text_hash=%s",
+                               attempt, max_attempts, actual_voice, EDGE_TTS_VERSION, kind,
+                               entry["error_type"], status, entry["duration_ms"], len(normalized_text), text_hash)
+                no_audio = kind == "no_audio"
+                can_switch = no_audio and index < len(candidates) - 1
+                exhausted = attempt == max_attempts or not transient or (no_audio and len(candidates) == 1)
+                if exhausted:
+                    # Nếu là tiếng Việt và Edge thất bại hoàn toàn, tự động kích hoạt gTTS cứu hộ khẩn cấp
+                    if lang_clean == "vi" and not os.getenv("DISABLE_GTTS_FALLBACK"):
+                        try:
+                            logger.info("Edge failed for Vietnamese, activating emergency gTTS fallback...")
+                            temp_vi = target_dir / f"tmp_vi_{uuid.uuid4().hex}.tmp"
+                            if await synthesize_gtts(normalized_text, temp_vi) and is_valid_mp3_file(temp_vi):
+                                size = temp_vi.stat().st_size
+                                os.replace(temp_vi, filepath)
+                                return result(actual_voice, filename, False)
+                        except Exception:
+                            pass
+                    voices_tried = ", ".join(dict.fromkeys(a["voice"] for a in attempts))
+                    message = (f"Edge TTS không tạo được MP3. Giọng đã thử: {voices_tried}. "
+                               f"Loại lỗi: {kind} ({type(exc).__name__}).")
+                    error_class = TTSTimeoutError if kind == "timeout" else TTSError
+                    cause = exc.cause if isinstance(exc, TTSError) else type(exc).__name__
+                    raise error_class(message, cause=cause, retryable=transient and not no_audio,
+                                      attempts=attempts) from exc
+                if can_switch:
+                    index += 1
+                    logger.info("Edge fallback from_voice=%s to_voice=%s reason=NoAudioReceived",
+                                actual_voice, candidates[index])
+                else:
+                    await asyncio.sleep(min(attempt, 2))
+            finally:
+                temp_file.unlink(missing_ok=True)
 
-        except asyncio.TimeoutError as exc:
-            if temp_file.is_file():
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
-            logger.error(
-                "Edge TTS timeout sau %.1f giây: text_hash=%s", timeout, text_hash
-            )
-            raise TTSTimeoutError(
-                f"Edge TTS không phản hồi sau {timeout} giây"
-            ) from exc
-        except Exception as exc:
-            if temp_file.is_file():
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
-            logger.error(
-                "Edge TTS gặp lỗi: text_hash=%s, err_type=%s",
-                text_hash,
-                type(exc).__name__,
-            )
-            if isinstance(exc, (TTSError, TTSTimeoutError)):
-                raise
-            raise TTSError(
-                f"Lỗi tạo âm thanh với Edge TTS: {str(exc)}"
-            ) from exc
 
-        # Kiểm tra xác nhận file cuối cùng đã ghi đĩa thành công
-        if not filepath.is_file() or filepath.stat().st_size == 0:
-            raise TTSError("Không thể xác minh file âm thanh sau khi ghi đĩa")
-
-        return {
-            "lang": lang_clean,
-            "voice": voice,
-            "text_hash": text_hash,
-            "audio_filename": filename,
-            "audio_url": f"/audio/{filename}",
-            "cache_hit": False,
-        }
