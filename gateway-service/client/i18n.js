@@ -127,7 +127,7 @@
       el.textContent = translate(text, language);
     }
     function apply(lang) {
-      language = ["vi", "en", "ja"].includes(lang) ? lang : "vi";
+      language = ["vi", "en", "ja", "fr", "es"].includes(lang) ? lang : "vi";
       document.documentElement.lang = language;
       document.title = translate(originalTitle, language);
       nodes.forEach(([node, text]) => { if (node.isConnected) node.textContent = translate(text, language); });

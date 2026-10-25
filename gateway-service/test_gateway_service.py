@@ -140,7 +140,7 @@ def test_detect_coords_out_of_range(lat, lon):
     assert resp.status_code == 422
 
 
-@pytest.mark.parametrize("lang", ["fr", "de", "zh", "korean", ""])
+@pytest.mark.parametrize("lang", ["it", "de", "zh", "korean", ""])
 def test_detect_language_not_in_allowlist(lang):
     resp = client.post(
         "/locations/detect",
@@ -683,9 +683,16 @@ def test_debug_tts_invalid_language():
     """
     POST /debug/text-to-speech với ngôn ngữ không hỗ trợ -> 422.
     """
-    payload = {"text": "Bonjour", "lang": "fr"}
+    payload = {"text": "Privet", "lang": "ru"}
     resp = client.post("/debug/text-to-speech", json=payload)
     assert resp.status_code == 422
+
+
+def test_supported_new_languages_fr_and_es():
+    """fr và es được gateway hỗ trợ đầy đủ."""
+    from main import ALLOWED_LANGS
+    assert "fr" in ALLOWED_LANGS
+    assert "es" in ALLOWED_LANGS
 
 
 def test_debug_tts_upstream_timeout():

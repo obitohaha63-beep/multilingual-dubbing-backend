@@ -133,7 +133,7 @@ class NarrationClients:
 
     async def source(self, client, location):
         lang = location.get("source_lang") or "vi"
-        if lang not in {"vi", "en", "ja"}:
+        if lang not in {"vi", "en", "ja", "fr", "es"}:
             raise PipelineError("unsupported_source_language")
         page_id = location.get("source_page_id")
         params = {"action": "query", "prop": "extracts|info", "exintro": 1,
@@ -167,7 +167,7 @@ class NarrationClients:
                 raise PipelineError("source_invalid_text", "no_readable_text")
             if len(source) > 12000:
                 raise PipelineError("source_too_long", f"length={len(source)}")
-            if language not in {"vi", "en", "ja"}:
+            if language not in {"vi", "en", "ja", "fr", "es"}:
                 raise PipelineError("unsupported_language")
             if not re.fullmatch(r"[A-Za-z0-9._-]+", self.model):
                 raise PipelineError("gemini_invalid_model")
@@ -180,7 +180,7 @@ class NarrationClients:
             self.diagnostic("configuration_error", job_id=job_id, model=self.model, api_key_present=False)
             raise PipelineError("gemini_auth_error", "GEMINI_API_KEY is not configured")
 
-        languages = {"vi": "tiếng Việt", "en": "English", "ja": "日本語"}
+        languages = {"vi": "tiếng Việt", "en": "English", "ja": "日本語", "fr": "français", "es": "español"}
         target_language_name = languages.get(language, language)
         instruction = (
             f"Viết lời thuyết minh du lịch bằng {target_language_name}, tối đa {min(self.target_chars, 1050)} ký tự kể cả khoảng trắng, "

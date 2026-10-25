@@ -334,7 +334,7 @@ def test_delete_narration_is_idempotent_and_updates_is_ready(client):
     assert client.get(f"/locations/{loc}").json()["is_ready"] is False
     assert client.delete(f"/locations/{loc}/narrations/ja").json()["deleted"] is False  # lần 2 vẫn 200
     assert client.delete("/locations/99999/narrations/ja").status_code == 404
-    assert client.delete(f"/locations/{loc}/narrations/fr").status_code == 422
+    assert client.delete(f"/locations/{loc}/narrations/zh").status_code == 422
 
 
 # ----------------- invalidation, xóa location, restart ----------------------

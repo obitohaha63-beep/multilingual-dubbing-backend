@@ -202,3 +202,20 @@ def test_error_log_sanitization():
     assert "MySecretPass123" not in clean
     assert "192.168.1.100" not in clean
     assert "[REDACTED]" in clean or "[IP_REDACTED]" in clean
+
+
+def test_supabase_visitor_sync_and_internal_online_visitors(tmp_path):
+    """Kiểm tra số người truy cập được đồng bộ Supabase và số người đang dùng chạy nội bộ."""
+    db_file = str(tmp_path / "supabase_test_analytics.db")
+    analytics_store.init_analytics_db(db_file)
+
+    # Ghi nhận lượt xem trang
+    analytics_store.record_page_view("client_sp_1", path="/app/", db_path=db_file)
+    analytics_store.record_heartbeat("client_sp_1", user_agent_short="TestBrowser", db_path=db_file)
+
+    # Thống kê: online_visitors được tính nội bộ qua heartbeat
+    summary = analytics_store.get_analytics_summary(db_path=db_file)
+    assert summary["online_visitors"] == 1
+    assert summary["page_views_24h"] >= 1
+    assert "supabase_visitors_total" in summary
+    assert "supabase_storage_enabled" in summary

@@ -766,12 +766,20 @@ def test_tts_timeout_returns_503(tmp_path, monkeypatch):
 
 def test_tts_unsupported_language_returns_422():
     """Ngôn ngữ ngoài allowlist trả về HTTP 422."""
-    for unsupported in ["fr", "zh", "ko", "de", "es"]:
+    for unsupported in ["zh", "ko", "de", "ru", "it"]:
         resp = client.post(
             "/text-to-speech",
             json={"text": "Hello world", "lang": unsupported},
         )
         assert resp.status_code == 422
+
+
+def test_tts_supported_new_languages_fr_and_es():
+    """fr và es nằm trong allowlist ngôn ngữ hợp lệ."""
+    assert "fr" in tts.ALLOWED_LANGS
+    assert "es" in tts.ALLOWED_LANGS
+    assert tts.get_voice_for_lang("fr") == "fr-FR-DeniseNeural"
+    assert tts.get_voice_for_lang("es") == "es-ES-ElviraNeural"
 
 
 def test_tts_text_validation_limits():
