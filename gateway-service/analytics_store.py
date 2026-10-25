@@ -18,10 +18,17 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import httpx
+
+# Cấu hình Supabase từ biến môi trường
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # Xác định đường dẫn file database analytics
 # Nếu có DB_PATH (như trong Docker /app/data/content.db), ta dùng cùng thư mục /app/data/analytics.db
@@ -35,6 +42,75 @@ if not _DEFAULT_DB_PATH:
         _DEFAULT_DB_PATH = str(Path(__file__).resolve().parent / "analytics.db")
 
 ANALYTICS_DB_PATH = _DEFAULT_DB_PATH
+
+
+def _sync_visit_to_supabase(client_id: str, path: str = "/app/", user_agent: str = "") -> None:
+    """
+    Đồng bộ số lượt truy cập người dùng lên Supabase Database để lưu trữ vĩnh viễn.
+    Chạy background non-blocking, hỗ trợ cả Supabase REST API và PostgreSQL direct connection.
+    """
+    if not client_id:
+        return
+
+    # Cách 1: PostgREST API (không phụ thuộc driver C/binary, hoạt động trên mọi môi trường)
+    if SUPABASE_URL and SUPABASE_SECRET_KEY:
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/visitor_access_logs"
+            headers = {
+                "apikey": SUPABASE_SECRET_KEY,
+                "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }
+            payload = {
+                "client_id": client_id[:64],
+                "path": path[:120],
+                "user_agent_short": user_agent[:120] if user_agent else "",
+            }
+            with httpx.Client(timeout=3.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                if resp.is_success:
+                    return
+        except Exception:
+            pass
+
+    # Cách 2: PostgreSQL trực tiếp qua DATABASE_URL nếu có driver
+    if DATABASE_URL:
+        try:
+            from sqlalchemy import create_engine, text
+            engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+            with engine.connect() as pg_conn:
+                pg_conn.execute(
+                    text("INSERT INTO public.visitor_access_logs (client_id, path, user_agent_short) VALUES (:cid, :p, :ua)"),
+                    {"cid": client_id[:64], "p": path[:120], "ua": user_agent[:120] if user_agent else ""}
+                )
+                pg_conn.commit()
+        except Exception:
+            pass
+
+
+def _fetch_supabase_visitor_count() -> Optional[int]:
+    """Lấy tổng số lượt truy cập được lưu trữ trên Supabase."""
+    if SUPABASE_URL and SUPABASE_SECRET_KEY:
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/visitor_access_logs?select=count"
+            headers = {
+                "apikey": SUPABASE_SECRET_KEY,
+                "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+                "Range-Unit": "items",
+                "Range": "0-0",
+                "Prefer": "count=exact",
+            }
+            with httpx.Client(timeout=3.0) as client:
+                resp = client.head(url, headers=headers)
+                cr = resp.headers.get("content-range")
+                if cr and "/" in cr:
+                    total_str = cr.split("/")[-1]
+                    if total_str.isdigit():
+                        return int(total_str)
+        except Exception:
+            pass
+    return None
 
 
 def _get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
@@ -140,7 +216,7 @@ def record_heartbeat(client_id: str, user_agent_short: str = "", db_path: Option
         conn.close()
 
 
-def record_page_view(client_id: str, path: str = "/app/", db_path: Optional[str] = None) -> None:
+def record_page_view(client_id: str, path: str = "/app/", user_agent: str = "", db_path: Optional[str] = None) -> None:
     """Ghi nhận lượt xem trang HTML duy nhất (không ghi cho API polling / heartbeat)."""
     if not client_id or len(client_id) > 64:
         return
@@ -154,12 +230,19 @@ def record_page_view(client_id: str, path: str = "/app/", db_path: Optional[str]
         # Đồng thời cập nhật session
         conn.execute("""
             INSERT INTO visitor_sessions (client_id, first_seen_ts, last_seen_ts, total_heartbeats, user_agent_short)
-            VALUES (?, ?, ?, 1, '')
+            VALUES (?, ?, ?, 1, ?)
             ON CONFLICT(client_id) DO UPDATE SET
                 last_seen_ts = excluded.last_seen_ts
-        """, (client_id, now, now))
+        """, (client_id, now, now, user_agent[:100] if user_agent else ''))
     finally:
         conn.close()
+
+    # Đồng bộ lưu trữ bền vững vào Database Supabase (background thread không block request)
+    threading.Thread(
+        target=_sync_visit_to_supabase,
+        args=(client_id, path, user_agent),
+        daemon=True,
+    ).start()
 
 
 def record_location_event(
@@ -342,11 +425,17 @@ def get_analytics_summary(db_path: Optional[str] = None) -> Dict[str, Any]:
         """, (d7_threshold,)).fetchall()
         lang_distribution = {row["language"]: row["count"] for row in lang_rows}
 
+        # 8. Lấy số liệu khách truy cập từ Supabase (nếu có cấu hình)
+        supabase_count = _fetch_supabase_visitor_count()
+        has_supabase = bool(SUPABASE_URL and SUPABASE_SECRET_KEY) or bool(DATABASE_URL)
+
         return {
-            "online_visitors": online_count,
+            "online_visitors": online_count,  # Chạy nội bộ theo heartbeat 90s
             "unique_visitors_24h": visitors_24h,
             "unique_visitors_7d": visitors_7d,
             "page_views_24h": page_views_24h,
+            "supabase_visitors_total": supabase_count,
+            "supabase_storage_enabled": has_supabase,
             "tts_requests_24h": r_tts["total_tts"] if r_tts and r_tts["total_tts"] else 0,
             "tts_success_24h": r_tts["tts_success"] if r_tts and r_tts["tts_success"] else 0,
             "tts_fail_24h": r_tts["tts_fail"] if r_tts and r_tts["tts_fail"] else 0,

@@ -402,6 +402,24 @@ class TourStateManager {
   const btnAudioMute = document.getElementById("btn-audio-mute");
   const btnAudioReplay = document.getElementById("btn-audio-replay");
 
+  // Timeline & Seek Controls (Tuần 5: Chỉnh thời lượng khi thuyết minh)
+  const audioSeekBar = document.getElementById("audio-seek-bar");
+  const audioCurrentTime = document.getElementById("audio-current-time");
+  const audioDuration = document.getElementById("audio-duration");
+  const btnAudioRewind = document.getElementById("btn-audio-rewind");
+  const btnAudioPlayPause = document.getElementById("btn-audio-play-pause");
+  const btnAudioForward = document.getElementById("btn-audio-forward");
+  let isSeeking = false;
+
+  function formatAudioTime(seconds) {
+    if (!seconds || isNaN(seconds) || !isFinite(seconds) || seconds < 0) {
+      return "00:00";
+    }
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m < 10 ? "0" : ""}${m}:${s < 10 ? "0" : ""}${s}`;
+  }
+
   // UI Helpers
   function setGpsStatus(text, badgeClass) {
     if (gpsStatus) {
@@ -458,6 +476,8 @@ class TourStateManager {
     if (l === "vi") return "vi-VN";
     if (l === "en") return "en-US";
     if (l === "ja") return "ja-JP";
+    if (l === "fr") return "fr-FR";
+    if (l === "es") return "es-ES";
     return lang;
   }
 
@@ -493,6 +513,20 @@ class TourStateManager {
     hidePermissionBanner();
     setPlayerStatus("Đã dừng phát", "badge-neutral");
     if (btnAudioStop) btnAudioStop.disabled = true;
+
+    // Reset Timeline & Seek Bar
+    if (audioSeekBar) {
+      audioSeekBar.value = 0;
+      audioSeekBar.disabled = true;
+    }
+    if (audioCurrentTime) audioCurrentTime.textContent = "00:00";
+    if (audioDuration) audioDuration.textContent = "00:00";
+    if (btnAudioRewind) btnAudioRewind.disabled = true;
+    if (btnAudioForward) btnAudioForward.disabled = true;
+    if (btnAudioPlayPause) {
+      btnAudioPlayPause.disabled = true;
+      btnAudioPlayPause.textContent = "⏸ Tạm dừng";
+    }
   }
 
   function fallbackToSpeech(text, lang, key, reason) {
@@ -578,11 +612,35 @@ class TourStateManager {
         manager.markPlaybackEnded(key);
         setPlayerStatus("Đã phát xong", "badge-neutral");
         if (btnAudioStop) btnAudioStop.disabled = true;
+        if (btnAudioPlayPause) btnAudioPlayPause.disabled = true;
+        if (audioSeekBar) audioSeekBar.value = 100;
       };
 
       audioElement.onerror = () => {
         console.warn("[audioElement onerror] File MP3 bị lỗi hoặc 404, fallback sang SpeechSynthesis.");
         fallbackToSpeech(translated_text, lang, key, "File MP3 lỗi hoặc 404 từ Gateway");
+      };
+
+      audioElement.ontimeupdate = () => {
+        if (!isSeeking && audioElement.duration && isFinite(audioElement.duration)) {
+          const cur = audioElement.currentTime;
+          const dur = audioElement.duration;
+          if (audioCurrentTime) audioCurrentTime.textContent = formatAudioTime(cur);
+          if (audioSeekBar) audioSeekBar.value = ((cur / dur) * 100).toFixed(1);
+        }
+      };
+
+      audioElement.onloadedmetadata = () => {
+        if (audioElement.duration && isFinite(audioElement.duration)) {
+          if (audioDuration) audioDuration.textContent = formatAudioTime(audioElement.duration);
+          if (audioSeekBar) audioSeekBar.disabled = false;
+          if (btnAudioRewind) btnAudioRewind.disabled = false;
+          if (btnAudioForward) btnAudioForward.disabled = false;
+          if (btnAudioPlayPause) {
+            btnAudioPlayPause.disabled = false;
+            btnAudioPlayPause.textContent = "⏸ Tạm dừng";
+          }
+        }
       };
 
       const playPromise = audioElement.play();
@@ -641,7 +699,13 @@ class TourStateManager {
     setGpsStatus("Đang nhận GPS", "badge-success");
     coordsDisplay.textContent = `${coords.latitude.toFixed(5)}, ${coords.longitude.toFixed(5)}`;
     ui.setText(accuracyDisplay, `±${Math.round(coords.accuracy)}m`);
-    timestampDisplay.textContent = new Date(now).toLocaleTimeString({vi: "vi-VN", en: "en-US", ja: "ja-JP"}[langSelect.value]);
+    timestampDisplay.textContent = new Date(now).toLocaleTimeString({
+      vi: "vi-VN",
+      en: "en-US",
+      ja: "ja-JP",
+      fr: "fr-FR",
+      es: "es-ES",
+    }[langSelect.value] || "vi-VN");
 
     checkAndSendDetect();
   }
@@ -934,6 +998,67 @@ class TourStateManager {
       if (currentNarrationPayload) {
         // Nút Phát lại: Thao tác chủ động của người dùng -> bypass playedKeys
         playNarration(currentNarrationPayload, true);
+      }
+    });
+  }
+
+  // Sự kiện chỉnh thời lượng bằng Slider
+  if (audioSeekBar) {
+    audioSeekBar.addEventListener("input", () => {
+      isSeeking = true;
+      if (audioElement.duration && isFinite(audioElement.duration)) {
+        const seekRatio = parseFloat(audioSeekBar.value) / 100;
+        const targetTime = seekRatio * audioElement.duration;
+        if (audioCurrentTime) audioCurrentTime.textContent = formatAudioTime(targetTime);
+      }
+    });
+
+    audioSeekBar.addEventListener("change", () => {
+      if (audioElement.duration && isFinite(audioElement.duration)) {
+        const seekRatio = parseFloat(audioSeekBar.value) / 100;
+        audioElement.currentTime = seekRatio * audioElement.duration;
+      }
+      isSeeking = false;
+    });
+  }
+
+  // Nút Tua lùi 10s
+  if (btnAudioRewind) {
+    btnAudioRewind.addEventListener("click", () => {
+      if (audioElement && audioElement.duration) {
+        audioElement.currentTime = Math.max(0, audioElement.currentTime - 10);
+        if (audioCurrentTime) audioCurrentTime.textContent = formatAudioTime(audioElement.currentTime);
+        if (audioSeekBar) audioSeekBar.value = ((audioElement.currentTime / audioElement.duration) * 100).toFixed(1);
+      }
+    });
+  }
+
+  // Nút Tua tới 10s
+  if (btnAudioForward) {
+    btnAudioForward.addEventListener("click", () => {
+      if (audioElement && audioElement.duration) {
+        audioElement.currentTime = Math.min(audioElement.duration, audioElement.currentTime + 10);
+        if (audioCurrentTime) audioCurrentTime.textContent = formatAudioTime(audioElement.currentTime);
+        if (audioSeekBar) audioSeekBar.value = ((audioElement.currentTime / audioElement.duration) * 100).toFixed(1);
+      }
+    });
+  }
+
+  // Nút Tạm dừng / Tiếp tục
+  if (btnAudioPlayPause) {
+    btnAudioPlayPause.addEventListener("click", () => {
+      if (!audioElement || !audioElement.src) return;
+      if (audioElement.paused) {
+        audioElement.play().then(() => {
+          btnAudioPlayPause.textContent = "⏸ Tạm dừng";
+          setPlayerStatus("Đang phát MP3", "badge-success");
+        }).catch((err) => {
+          console.warn("Không thể tiếp tục phát:", err);
+        });
+      } else {
+        audioElement.pause();
+        btnAudioPlayPause.textContent = "▶ Tiếp tục";
+        setPlayerStatus("Tạm dừng phát", "badge-warning");
       }
     });
   }

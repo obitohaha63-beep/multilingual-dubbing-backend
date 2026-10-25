@@ -101,7 +101,20 @@ REVOKE ALL ON public.narration_cache FROM anon, authenticated;
 
 ALTER TABLE public.narrations ENABLE ROW LEVEL SECURITY;
 
-REVOKE ALL ON public.narrations FROM anon, authenticated;
+CREATE TABLE IF NOT EXISTS public.visitor_access_logs (
+	id BIGSERIAL NOT NULL,
+	client_id VARCHAR(64) NOT NULL,
+	path VARCHAR(120) NOT NULL DEFAULT '/app/',
+	user_agent_short VARCHAR(120),
+	created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc'),
+	PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_visitor_access_created_at ON public.visitor_access_logs (created_at);
+CREATE INDEX IF NOT EXISTS ix_visitor_access_client_id ON public.visitor_access_logs (client_id);
+
+ALTER TABLE public.visitor_access_logs ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON public.visitor_access_logs FROM anon, authenticated;
 
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types) VALUES ('narration-audio', 'narration-audio', false, 2000000, ARRAY['audio/mpeg']) ON CONFLICT (id) DO NOTHING;
 

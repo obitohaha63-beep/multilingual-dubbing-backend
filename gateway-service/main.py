@@ -50,8 +50,20 @@ TTS_SERVICE_URL = os.getenv("TTS_SERVICE_URL", "http://translate-audio-service:8
 DEFAULT_TIMEOUT = float(os.getenv("GATEWAY_TIMEOUT", "6.0"))
 GATEWAY_NARRATE_TIMEOUT = float(os.getenv("GATEWAY_NARRATE_TIMEOUT", "30.0"))
 
-ALLOWED_LANGS = {"vi", "en", "ja"}
+ALLOWED_LANGS = {"vi", "en", "ja", "fr", "es"}
 CLIENT_DIR = Path(__file__).resolve().parent / "client"
+
+# Persistent connection pool tối ưu hóa độ trễ giữa Gateway -> Downstream microservices
+_shared_client: Optional[httpx.AsyncClient] = None
+
+def get_shared_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(GATEWAY_NARRATE_TIMEOUT, connect=3.0, read=GATEWAY_NARRATE_TIMEOUT),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=60.0),
+        )
+    return _shared_client
 
 
 # ===========================================================================
