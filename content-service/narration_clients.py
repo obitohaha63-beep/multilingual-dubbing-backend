@@ -255,8 +255,10 @@ class NarrationClients:
                     parts = content.get("parts", [])
                     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                     checked = check_text(text)
+                    duration_ms = round((time.monotonic() - started) * 1000)
                     self.diagnostic("validated", model=self.model, job_id=job_id,
                                     output_length=len(checked), response_status="valid")
+                    logger.info(f"[Timing] Gemini: duration={duration_ms}ms, job_id={job_id}, model={self.model}, chars={len(checked)}")
                     return checked
                 except PipelineError as exc:
                     self.diagnostic("output_rejected", model=self.model, job_id=job_id,
@@ -310,6 +312,7 @@ class NarrationClients:
 
     async def speech(self, client, row):
         # Edge owns its bounded retries. Do not multiply three Edge attempts by HTTP retries.
+        t_start = time.monotonic()
         try:
             response = await client.post(f"{self.tts_url}/text-to-speech",
                 json={"text": check_text(row["final_text"]), "lang": row["language"], "voice": row["voice"]},
@@ -337,6 +340,8 @@ class NarrationClients:
             if (data["voice"] not in allowed_voices or data["text_hash"] != expected
                     or data.get("requested_voice", row["voice"]) != row["voice"]):
                 raise PipelineError("tts_text_mismatch")
+            duration_ms = round((time.monotonic() - t_start) * 1000, 1)
+            logger.info(f"[Timing] TTS: duration={duration_ms}ms, lang={row['language']}, voice={data.get('voice')}")
             return {"audio_filename": filename, "voice": data["voice"]}
         except (ValueError, KeyError, TypeError) as exc:
             raise PipelineError("tts_invalid_response") from exc
