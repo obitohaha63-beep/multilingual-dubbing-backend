@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import math
+import logging
 import re
 import time
 from pathlib import Path
@@ -25,6 +26,19 @@ from pydantic import BaseModel, ConfigDict, field_validator
 import admin_auth
 import admin_view
 import analytics_store
+from poi_filter import is_valid_travel_poi
+
+logger = logging.getLogger("uvicorn.error.gateway")
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2.0) ** 2
+    return 2.0 * R * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
 
 # Khởi tạo CSDL analytics nếu chưa có
 analytics_store.init_analytics_db()
@@ -183,104 +197,125 @@ async def check_services_health():
 async def detect_location(req: DetectRequest):
     """
     Tiếp nhận tọa độ GPS từ Client, điều phối kiểm tra nearby và discovery:
-    1. Gọi content-service GET /locations/nearby (max_distance=500m)
-    2. Chọn candidate gần nhất thỏa distance_m <= radius (activation radius).
+    1. Gọi content-service GET /locations/nearby (max_distance=500m).
+    2. Chọn candidate hợp lệ gần nhất thỏa distance_m <= radius (activation radius).
     3. Nếu không có candidate kích hoạt:
-       - Gọi content-service GET /locations/discover (bán kính 500m) để tìm bài viết từ Wikimedia (kèm cache)
-       - Sau khi discover, gọi lại /locations/nearby và xét lại candidate kích hoạt
+       - Gọi content-service GET /locations/discover (bán kính 500m) để tìm bài viết từ Wikimedia (kèm cache).
+       - Tích hợp và tính khoảng cách ngay từ kết quả discover (tránh gọi /locations/nearby lần hai).
+       - Xét lại candidate kích hoạt hợp lệ.
     4. Nếu có candidate kích hoạt (distance_m <= radius):
        - Gọi Content /narrate, trả trạng thái chờ hoặc URL MP3 đã lưu.
     5. Nếu ngoài radius (khoảng cách > radius):
        - detected=False, reason='outside_activation_radius'
-    6. Nếu không có địa điểm nào trong 500m:
+    6. Nếu không có địa điểm POI hợp lệ nào trong 500m:
        - detected=False, reason='no_place_found'
     """
+    t_detect_start = time.monotonic()
+    nearby_ms = 0.0
+    discover_ms = 0.0
+    narrate_ms = 0.0
     candidates: List[Dict[str, Any]] = []
 
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as http_client:
-        # Bước 1: Gọi /locations/nearby
+    http_client = get_shared_client()
+
+    # Bước 1: Gọi /locations/nearby
+    t0 = time.monotonic()
+    try:
+        nearby_resp = await http_client.get(
+            f"{CONTENT_SERVICE_URL}/locations/nearby",
+            params={"latitude": req.latitude, "longitude": req.longitude, "max_distance": 500.0},
+        )
+    except httpx.RequestError:
+        return DetectResponse(
+            detected=False,
+            reason="upstream_unavailable",
+            requested_lang=req.language,
+            is_fallback=False,
+            narration_status=None,
+        )
+    nearby_ms = round((time.monotonic() - t0) * 1000, 1)
+
+    if nearby_resp.status_code == 503 or nearby_resp.is_server_error:
+        return DetectResponse(
+            detected=False,
+            reason="upstream_unavailable",
+            requested_lang=req.language,
+            is_fallback=False,
+            narration_status=None,
+        )
+    elif nearby_resp.is_error:
+        # Lỗi client 4xx hoặc khác
+        raise HTTPException(
+            status_code=nearby_resp.status_code,
+            detail=f"Lỗi từ content-service: {nearby_resp.text}",
+        )
+
+    nearby_data = nearby_resp.json()
+    candidates = nearby_data.get("candidates", [])
+
+    # Kiểm tra xem có candidate nào thỏa activation radius và là POI hợp lệ chưa
+    active_candidate = _find_active_candidate(candidates)
+
+    # Bước 2: Nếu chưa có candidate kích hoạt, gọi /locations/discover
+    if not active_candidate:
+        t0 = time.monotonic()
         try:
-            nearby_resp = await http_client.get(
-                f"{CONTENT_SERVICE_URL}/locations/nearby",
-                params={"latitude": req.latitude, "longitude": req.longitude, "max_distance": 500.0},
+            discover_resp = await http_client.get(
+                f"{CONTENT_SERVICE_URL}/locations/discover",
+                params={"latitude": req.latitude, "longitude": req.longitude, "radius": 500.0, "limit": 10},
             )
-        except httpx.RequestError as exc:
+        except httpx.RequestError:
             return DetectResponse(
                 detected=False,
                 reason="upstream_unavailable",
                 requested_lang=req.language,
                 is_fallback=False,
                 narration_status=None,
+                candidates=candidates or None,
             )
+        discover_ms = round((time.monotonic() - t0) * 1000, 1)
 
-        if nearby_resp.status_code == 503 or nearby_resp.is_server_error:
+        if discover_resp.status_code == 503 or discover_resp.is_server_error:
             return DetectResponse(
                 detected=False,
                 reason="upstream_unavailable",
                 requested_lang=req.language,
                 is_fallback=False,
                 narration_status=None,
+                candidates=candidates or None,
             )
-        elif nearby_resp.is_error:
-            # Lỗi client 4xx hoặc khác
+        elif discover_resp.is_error:
             raise HTTPException(
-                status_code=nearby_resp.status_code,
-                detail=f"Lỗi từ content-service: {nearby_resp.text}",
+                status_code=discover_resp.status_code,
+                detail=f"Lỗi từ content-service /discover: {discover_resp.text}",
             )
 
-        nearby_data = nearby_resp.json()
-        candidates = nearby_data.get("candidates", [])
+        # Tránh gọi /locations/nearby lần hai: tính khoảng cách và gộp ngay trong RAM
+        discover_candidates = discover_resp.json().get("candidates", [])
+        candidates_by_id = {c["id"]: c for c in candidates if "id" in c}
+        for dc in discover_candidates:
+            if "id" in dc and dc["id"] not in candidates_by_id:
+                if dc.get("distance_m") is None and dc.get("latitude") and dc.get("longitude"):
+                    dc["distance_m"] = round(haversine_m(req.latitude, req.longitude, dc["latitude"], dc["longitude"]), 1)
+                candidates.append(dc)
+                candidates_by_id[dc["id"]] = dc
 
-        # Kiểm tra xem có candidate nào thỏa activation radius chưa
+        # Sắp xếp lại danh sách theo khoảng cách
+        candidates.sort(key=lambda c: (c.get("distance_m") is None, c.get("distance_m") or 9999.0))
         active_candidate = _find_active_candidate(candidates)
 
-        # Bước 2: Nếu chưa có candidate kích hoạt, gọi /locations/discover
-        if not active_candidate:
-            try:
-                discover_resp = await http_client.get(
-                    f"{CONTENT_SERVICE_URL}/locations/discover",
-                    params={"latitude": req.latitude, "longitude": req.longitude, "radius": 500.0, "limit": 5},
-                )
-            except httpx.RequestError:
-                return DetectResponse(
-                    detected=False,
-                    reason="upstream_unavailable",
-                    requested_lang=req.language,
-                    is_fallback=False,
-                    narration_status=None,
-                    candidates=candidates or None,
-                )
+    # Bước 3: Lọc danh sách POI hợp lệ để hiển thị và đánh giá kích hoạt
+    valid_candidates = []
+    for c in candidates:
+        name = c.get("name") or c.get("source_title") or ""
+        desc = c.get("description_source") or c.get("description_vi") or ""
+        is_valid, _, _ = is_valid_travel_poi(name, desc)
+        if is_valid:
+            valid_candidates.append(c)
 
-            if discover_resp.status_code == 503 or discover_resp.is_server_error:
-                return DetectResponse(
-                    detected=False,
-                    reason="upstream_unavailable",
-                    requested_lang=req.language,
-                    is_fallback=False,
-                    narration_status=None,
-                    candidates=candidates or None,
-                )
-            elif discover_resp.is_error:
-                raise HTTPException(
-                    status_code=discover_resp.status_code,
-                    detail=f"Lỗi từ content-service /discover: {discover_resp.text}",
-                )
-
-            # Sau khi discover (đã upsert vào DB và có cache), gọi lại /nearby để lấy distance_m chuẩn
-            try:
-                second_nearby = await http_client.get(
-                    f"{CONTENT_SERVICE_URL}/locations/nearby",
-                    params={"latitude": req.latitude, "longitude": req.longitude, "max_distance": 500.0},
-                )
-                if second_nearby.is_success:
-                    candidates = second_nearby.json().get("candidates", [])
-                    active_candidate = _find_active_candidate(candidates)
-            except httpx.RequestError:
-                # Nếu lần nearby 2 lỗi mạng, vẫn giữ kết quả trước
-                pass
-
-    # Bước 3: Đánh giá kết quả tìm kiếm và kích hoạt
-    if not candidates:
+    if not valid_candidates:
+        total_ms = round((time.monotonic() - t_detect_start) * 1000, 1)
+        logger.info(f"[Timing] detect: total={total_ms}ms (no valid POI), nearby={nearby_ms}ms, discover={discover_ms}ms")
         return DetectResponse(
             detected=False,
             reason="no_place_found",
@@ -305,18 +340,20 @@ async def detect_location(req: DetectRequest):
         narrate_payload = {"location_id": int(active_candidate["id"]),
                            "target_lang": req.language, "voice": req.voice}
 
-        narrate_timeout = httpx.Timeout(GATEWAY_NARRATE_TIMEOUT, connect=5.0, read=GATEWAY_NARRATE_TIMEOUT)
-        narrate_start_time = time.time()
+        t_narrate_start = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=narrate_timeout) as narrate_client:
-                narrate_resp = await narrate_client.post(
-                    f"{CONTENT_SERVICE_URL}/narrate",
-                    json=narrate_payload,
-                )
+            narrate_resp = await http_client.post(
+                f"{CONTENT_SERVICE_URL}/narrate",
+                json=narrate_payload,
+                timeout=GATEWAY_NARRATE_TIMEOUT,
+            )
         except (httpx.TimeoutException, httpx.RequestError) as exc:
+            narrate_ms = round((time.monotonic() - t_narrate_start) * 1000, 1)
+            total_ms = round((time.monotonic() - t_detect_start) * 1000, 1)
             # Ghi nhận lỗi và event thất bại
             analytics_store.record_error_log("content-service", "POST /narrate", str(exc), 503, "NetworkError")
             analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", status_reason="narrate_unavailable")
+            logger.warning(f"[Timing] detect: total={total_ms}ms narrate_failed ({narrate_ms}ms)")
             return DetectResponse(
                 detected=True,
                 reason="narrate_unavailable",
@@ -329,16 +366,21 @@ async def detect_location(req: DetectRequest):
                 source_url=source_url,
                 is_fallback=False,
                 narration_status="error",
-                candidates=candidates,
+                candidates=valid_candidates,
             )
 
-        duration_ms = round((time.time() - narrate_start_time) * 1000, 1)
+        narrate_ms = round((time.monotonic() - t_narrate_start) * 1000, 1)
+        total_ms = round((time.monotonic() - t_detect_start) * 1000, 1)
+        logger.info(
+            f"[Timing] detect: total={total_ms}ms (nearby={nearby_ms}ms, discover={discover_ms}ms, narrate={narrate_ms}ms) "
+            f"detected=True active={active_candidate.get('name') or active_candidate.get('source_title')}"
+        )
 
         if narrate_resp.status_code == 202:
             return DetectResponse(detected=True, location=active_candidate,
                 distance_m=round(dist, 1) if dist is not None else None,
                 requested_lang=req.language, narration_status="processing",
-                retry_after=10, source_url=source_url, candidates=candidates)
+                retry_after=10, source_url=source_url, candidates=valid_candidates)
 
         if narrate_resp.status_code == 200:
             b_data = narrate_resp.json()
@@ -363,7 +405,7 @@ async def detect_location(req: DetectRequest):
                 int(active_candidate["id"]),
                 req.language,
                 "tts_success",
-                duration_ms=duration_ms,
+                duration_ms=narrate_ms,
                 is_fallback=b_data.get("is_fallback", False),
                 status_reason=b_data.get("narration_status", "audio_ready"),
             )
@@ -381,7 +423,7 @@ async def detect_location(req: DetectRequest):
                 is_fallback=b_data.get("is_fallback", False),
                 narration_status=b_data.get("narration_status", "audio_ready"),
                 cache_hit=b_data.get("cache_hit", False),
-                candidates=candidates,
+                candidates=valid_candidates,
             )
         else:
             # Content trả lỗi 4xx hoặc 5xx
@@ -392,7 +434,7 @@ async def detect_location(req: DetectRequest):
                 detail = narrate_resp.text
 
             analytics_store.record_error_log("content-service", "POST /narrate", str(detail), narrate_resp.status_code, "UpstreamError")
-            analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", duration_ms=duration_ms, status_reason=str(detail)[:100])
+            analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", duration_ms=narrate_ms, status_reason=str(detail)[:100])
 
             return DetectResponse(
                 detected=True,
@@ -406,12 +448,17 @@ async def detect_location(req: DetectRequest):
                 source_url=source_url,
                 is_fallback=False,
                 narration_status="error",
-                candidates=candidates,
+                candidates=valid_candidates,
             )
     else:
         # Có địa điểm trong 500m nhưng ngoài bán kính kích hoạt (activation radius)
-        closest = candidates[0]
+        closest = valid_candidates[0]
         dist = closest.get("distance_m")
+        total_ms = round((time.monotonic() - t_detect_start) * 1000, 1)
+        logger.info(
+            f"[Timing] detect: total={total_ms}ms (nearby={nearby_ms}ms, discover={discover_ms}ms) "
+            f"detected=False outside_radius closest={closest.get('name') or closest.get('source_title')} (dist={dist}m)"
+        )
         return DetectResponse(
             detected=False,
             reason="outside_activation_radius",
@@ -424,23 +471,38 @@ async def detect_location(req: DetectRequest):
             source_url=closest.get("source_url"),
             is_fallback=False,
             narration_status=None,
-            candidates=candidates,
+            candidates=valid_candidates,
         )
 
 
 def _find_active_candidate(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    Chọn candidate gần nhất thỏa điều kiện kích hoạt:
-    distance_m <= radius (mặc định 80m nếu radius không có)
-    candidates đã được content-service sắp xếp tăng dần theo distance_m.
+    Chọn candidate POI tham quan du lịch hợp lệ và đáng tin cậy:
+    1. Loại trừ các ứng viên không phải POI (quốc gia, chính thể, tổ chức, nhân vật, sự kiện chung, đơn vị hành chính diện rộng).
+    2. distance_m <= radius (mặc định 80m nếu radius không có).
+    3. Ưu tiên điểm POI cao và khoảng cách gần.
     """
+    activated = []
     for c in candidates:
+        name = c.get("name") or c.get("source_title") or ""
+        desc = c.get("description_source") or c.get("description_vi") or ""
+        categories = c.get("categories") or []
+        is_valid, reason, score = is_valid_travel_poi(name, desc, categories)
+        if not is_valid:
+            continue
+
         distance = c.get("distance_m")
         radius = c.get("radius")
         if radius is None:
             radius = 80.0
         if distance is not None and distance <= radius:
-            return c
+            activated.append((score, -distance, c))
+
+    if activated:
+        # Sắp xếp theo score giảm dần, sau đó khoảng cách gần nhất
+        activated.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return activated[0][2]
+
     return None
 
 
@@ -452,8 +514,8 @@ async def get_location_preview(id: int):
     """
     target_url = f"{CONTENT_SERVICE_URL}/locations/{id}"
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(target_url, timeout=DEFAULT_TIMEOUT)
+        client = get_shared_client()
+        response = await client.get(target_url, timeout=DEFAULT_TIMEOUT)
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
