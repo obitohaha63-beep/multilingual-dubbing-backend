@@ -2,12 +2,12 @@
 1 MIGRATION | 2 GPS | 3 WIKIMEDIA | 4 SCHEMA (JSON vào/ra) | 5 ROUTES."""
 from __future__ import annotations
 
-import math, os, re, shutil, sqlite3, time
+import hmac, math, os, re, shutil, sqlite3, time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select
@@ -102,8 +102,10 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
 
 
 def validate_coords(lat: Optional[float], lon: Optional[float]) -> None:
-    if lat is None or lon is None:
+    if lat is None and lon is None:
         return
+    if lat is None or lon is None:
+        raise ValueError("latitude và longitude phải cùng có hoặc cùng bỏ trống")
     if not (math.isfinite(lat) and math.isfinite(lon)):
         raise ValueError("Tọa độ phải là số hữu hạn")
     if not -90 <= lat <= 90 or not -180 <= lon <= 180:
@@ -145,9 +147,14 @@ def _wiki_request(client: httpx.Client, params: dict) -> dict:
     if resp.status_code >= 400:
         raise WikimediaError("upstream_error", f"HTTP {resp.status_code}")
     try:
-        return resp.json()
+        data = resp.json()
     except ValueError as exc:
         raise WikimediaError("upstream_error", "Phản hồi không phải JSON") from exc
+    if isinstance(data, dict) and "error" in data:  # MediaWiki báo lỗi với HTTP 200
+        err = data["error"]
+        code = err.get("code", "unknown") if isinstance(err, dict) else "unknown"
+        raise WikimediaError("upstream_error", f"Wikimedia báo lỗi: {code}")
+    return data
 
 
 def wikimedia_discover(lat: float, lon: float, radius: float, limit: int):
@@ -176,7 +183,10 @@ def wikimedia_discover(lat: float, lon: float, radius: float, limit: int):
         "latitude": geo_by_id[p["pageid"]].get("lat"), "longitude": geo_by_id[p["pageid"]].get("lon"),
         "last_synced_at": synced_at,
     } for p in pages.values() if p.get("extract") and p.get("pageid") in geo_by_id]
-    _wiki_cache[key] = (candidates, time.monotonic() + WIKI_CACHE_TTL_SECONDS)  # cache cả khi rỗng
+    now = time.monotonic()
+    for k in [k for k, v in _wiki_cache.items() if v[1] <= now]:  # dọn mục hết hạn, tránh phình RAM
+        _wiki_cache.pop(k, None)
+    _wiki_cache[key] = (candidates, now + WIKI_CACHE_TTL_SECONDS)  # cache cả khi rỗng
     return candidates, False
 
 
@@ -243,7 +253,7 @@ class NearbyCandidate(DiscoverCandidate):
     distance_m: float
 
 
-VALID_LANGS = {"vi", "en", "ja"}
+VALID_LANGS = {"vi", "en", "ja", "fr", "es"}
 AUDIO_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp3$", re.IGNORECASE)
 
 
@@ -350,6 +360,17 @@ def get_db():
         db.close()
 
 
+def require_internal_key(x_internal_key: Optional[str] = Header(None)) -> None:
+    """Nếu đặt INTERNAL_API_KEY thì các route GHI phải gửi đúng header X-Internal-Key.
+    Không đặt biến này = không kiểm tra (giữ hành vi cũ khi chạy local/test)."""
+    expected = os.environ.get("INTERNAL_API_KEY")
+    if expected and not hmac.compare_digest((x_internal_key or "").encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="Thiếu hoặc sai X-Internal-Key")
+
+
+WRITE = [Depends(require_internal_key)]
+
+
 def _get_location_or_404(db: Session, location_id: int) -> Location:
     location = db.get(Location, location_id)
     if location is None:
@@ -403,7 +424,7 @@ def _stored_wikimedia_near(db: Session, lat: float, lon: float, radius: float, l
 
 @app.get("/locations/discover")
 def locations_discover(latitude: float = Query(...), longitude: float = Query(...),
-                       radius: float = Query(500, gt=0), limit: int = Query(5, gt=0, le=50),
+                       radius: float = Query(500, ge=10, le=10000), limit: int = Query(5, gt=0, le=50),
                        db: Session = Depends(get_db)):
     """Tìm bài Wikipedia quanh tọa độ rồi UPSERT vào CSDL."""
     _check_gps(latitude, longitude)
@@ -466,7 +487,7 @@ def _upsert_wikimedia_location(db: Session, item: dict, fetched_now: bool = True
 
 
 # --- CRUD ---
-@app.post("/locations", response_model=LocationResponse)
+@app.post("/locations", response_model=LocationResponse, dependencies=WRITE)
 def create_location(body: LocationCreate, db: Session = Depends(get_db)):
     loc = Location(
         name=body.name, description_vi=body.description_vi, target_languages=body.target_languages,
@@ -489,7 +510,7 @@ def get_location(location_id: int, db: Session = Depends(get_db)):
     return _get_location_or_404(db, location_id)
 
 
-@app.put("/locations/{location_id}", response_model=LocationResponse)
+@app.put("/locations/{location_id}", response_model=LocationResponse, dependencies=WRITE)
 def update_location(location_id: int, body: LocationCreate, db: Session = Depends(get_db)):
     loc = _get_location_or_404(db, location_id)
     old = (loc.description_source, loc.latitude, loc.longitude)
@@ -504,7 +525,7 @@ def update_location(location_id: int, body: LocationCreate, db: Session = Depend
     return loc
 
 
-@app.delete("/locations/{location_id}")
+@app.delete("/locations/{location_id}", dependencies=WRITE)
 def delete_location(location_id: int, db: Session = Depends(get_db)):
     loc = _get_location_or_404(db, location_id)
     db.execute(delete(NarrationCache).where(NarrationCache.location_id == location_id))
@@ -524,7 +545,7 @@ def get_narration(location_id: int, language: str, db: Session = Depends(get_db)
     return {"cache_hit": True, "narration": narration_to_dict(row)}
 
 
-@app.put("/locations/{location_id}/narrations/{language}")
+@app.put("/locations/{location_id}/narrations/{language}", dependencies=WRITE)
 def put_narration(location_id: int, language: str, body: NarrationPut, db: Session = Depends(get_db)):
     """Upsert 1 narration theo (location_id, requested_lang=language)."""
     location = _get_location_or_404(db, location_id)
@@ -573,7 +594,7 @@ def put_narration(location_id: int, language: str, body: NarrationPut, db: Sessi
     return {"created": created, "narration": narration_to_dict(row)}
 
 
-@app.delete("/locations/{location_id}/narrations/{language}")
+@app.delete("/locations/{location_id}/narrations/{language}", dependencies=WRITE)
 def delete_narration(location_id: int, language: str, db: Session = Depends(get_db)):
     """B loại cache hỏng/hết hạn. Idempotent: key chưa có vẫn 200 (deleted=false)."""
     location = _get_location_or_404(db, location_id)
@@ -586,7 +607,7 @@ def delete_narration(location_id: int, language: str, db: Session = Depends(get_
     return {"deleted": row is not None, "id": location_id, "language": language}
 
 
-@app.patch("/locations/{location_id}/mark-ready")
+@app.patch("/locations/{location_id}/mark-ready", dependencies=WRITE)
 def mark_ready(location_id: int, db: Session = Depends(get_db)):
     """Tính lại is_ready TỪ CACHE (không nhận giá trị từ client)."""
     location = _get_location_or_404(db, location_id)
