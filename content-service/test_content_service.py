@@ -388,3 +388,58 @@ def test_text_ready_to_audio_ready_survives_restart(tmp_path, monkeypatch):
         n = _get(c, loc, "ja")
         assert n["cache_hit"] is True and n["narration"]["lang"] == "vi"
         assert c.get(f"/locations/{loc}").json()["is_ready"] is True
+
+
+@pytest.mark.parametrize("coords", [{"latitude": 10.77}, {"longitude": 106.7}])
+def test_location_requires_coordinates_as_pair(client, coords):
+    body = {"name": "A", "description_vi": "B", "target_languages": "en", **coords}
+    assert client.post("/locations", json=body).status_code == 422
+
+
+@pytest.mark.parametrize("radius", [5, 20000])
+def test_discover_radius_limited_to_wikimedia_range(client, radius):
+    r = client.get("/locations/discover", params={**GPS, "radius": radius})
+    assert r.status_code == 422
+
+
+def test_wikimedia_error_body_is_upstream_error_not_empty_result(client):
+    import main
+
+    class FakeResp:
+        status_code, headers = 200, {}
+        def json(self):
+            return {"error": {"code": "badvalue", "info": "x"}}
+
+    class FakeClient:
+        def get(self, *a, **k):
+            return FakeResp()
+
+    with pytest.raises(main.WikimediaError) as e:
+        main._wiki_request(FakeClient(), {})
+    assert e.value.code == "upstream_error"
+
+
+def test_wiki_cache_prunes_expired_entries(client):
+    import main
+    main._wiki_cache[("old", 0, 0, 0)] = ([], 0.0)  # đã hết hạn
+    with patch.object(main, "_wiki_request", return_value={"query": {"geosearch": []}}):
+        main.wikimedia_discover(10.77, 106.7, 500, 5)
+    assert ("old", 0, 0, 0) not in main._wiki_cache
+
+
+@pytest.mark.parametrize("lang", ["fr", "es"])
+def test_narration_cache_accepts_french_and_spanish(client, lang):
+    loc = _loc(client)
+    r = client.get(f"/locations/{loc}/narrations/{lang}")
+    assert r.status_code == 200 and r.json()["cache_hit"] is False
+
+
+def test_write_routes_require_internal_key_only_when_configured(client, monkeypatch):
+    body = {"name": "A", "description_vi": "B", "target_languages": "en"}
+    assert client.post("/locations", json=body).status_code == 200  # chưa cấu hình = mở
+    monkeypatch.setenv("INTERNAL_API_KEY", "s3cret")
+    assert client.post("/locations", json=body).status_code == 401
+    assert client.post("/locations", json=body, headers={"X-Internal-Key": "sai"}).status_code == 401
+    assert client.post("/locations", json=body, headers={"X-Internal-Key": "s3cret"}).status_code == 200
+    assert client.get("/locations").status_code == 200  # route đọc vẫn mở
+    assert client.patch("/locations/1/mark-ready").status_code == 401
