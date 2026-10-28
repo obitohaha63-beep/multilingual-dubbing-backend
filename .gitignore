@@ -5,6 +5,7 @@ __pycache__/
 
 # Pytest / Caches
 .pytest_cache/
+.pytest-work*/
 .coverage
 htmlcov/
 
@@ -33,3 +34,10 @@ audio_files/
 Thumbs.db
 .idea/
 .vscode/
+
+# Test artifacts
+*.log
+test.mp3
+test.txt
+test-upbranch.txt
+test-upbranch-congthanh.txt

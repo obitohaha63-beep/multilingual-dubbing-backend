@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hmac, math, os, re, shutil, sqlite3, time
+import logging, math, os, re, shutil, sqlite3, threading, time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -14,7 +16,12 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import Base, DB_PATH, Location, NarrationCache, SessionLocal, engine
+from models import Base, DB_PATH, IS_SQLITE, Location, Narration, NarrationCache, SessionLocal, engine
+from narration_clients import PipelineError
+from narration_pipeline import NarrationPipeline
+from poi_filter import is_valid_travel_poi, rank_candidates
+
+logger = logging.getLogger("uvicorn.error.content")
 
 # ============ 1. MIGRATION (create_all không tự thêm cột vào bảng cũ) ============
 NEW_COLUMNS = [("description_source", "TEXT"), ("latitude", "REAL"), ("longitude", "REAL"),
@@ -112,11 +119,34 @@ def validate_coords(lat: Optional[float], lon: Optional[float]) -> None:
         raise ValueError("latitude phải trong [-90,90], longitude trong [-180,180]")
 
 
-# ============ 3. WIKIMEDIA (cache RAM 60s theo ô ~100m) ============
+# ============ 3. WIKIMEDIA (cache RAM theo ô ~100m, 1 HTTP call, lọc POI) ============
 WIKI_API_URL = "https://vi.wikipedia.org/w/api.php"
 WIKI_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
-WIKI_CACHE_TTL_SECONDS = 60
+WIKI_CACHE_TTL_SECONDS = 120
 _wiki_cache: dict = {}
+_shared_wiki_client: Optional[httpx.Client] = None
+_wiki_client_lock = threading.Lock()
+_wiki_cell_locks: Dict[tuple, threading.Lock] = {}
+_cell_locks_guard = threading.Lock()
+
+
+def _get_wiki_client() -> httpx.Client:
+    global _shared_wiki_client
+    if _shared_wiki_client is None:
+        with _wiki_client_lock:
+            if _shared_wiki_client is None:
+                _shared_wiki_client = httpx.Client(
+                    timeout=WIKI_TIMEOUT,
+                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=60.0),
+                )
+    return _shared_wiki_client
+
+
+def _get_cell_lock(key: tuple) -> threading.Lock:
+    with _cell_locks_guard:
+        if key not in _wiki_cell_locks:
+            _wiki_cell_locks[key] = threading.Lock()
+        return _wiki_cell_locks[key]
 
 
 class WikimediaError(Exception):
@@ -158,36 +188,113 @@ def _wiki_request(client: httpx.Client, params: dict) -> dict:
 
 
 def wikimedia_discover(lat: float, lon: float, radius: float, limit: int):
-    """Trả (candidates, cache_hit). Bỏ bài thiếu tọa độ/giới thiệu; GPS lấy từ bài, không từ người dùng."""
-    key = (round(lat, 3), round(lon, 3), radius, limit)
-    cached = _wiki_cache.get(key)
-    if cached and cached[1] > time.monotonic():
-        return cached[0], True
+    """
+    Tìm kiếm và khám phá địa điểm Wikimedia quanh tọa độ:
+    - 1 lượt HTTP duy nhất (generator=geosearch + coordinates|extracts|info|categories).
+    - Tái sử dụng HTTP client connection pool.
+    - Cache RAM theo ô tọa độ ~100m, chống thundering herd bằng cell lock.
+    - Lọc bỏ các bài về quốc gia, thực thể chính trị, con người, đơn vị hành chính diện rộng.
+    - Xếp hạng theo độ ưu tiên POI và khoảng cách.
+    - Trả (candidates, cache_hit).
+    """
+    grid_key = (round(lat, 3), round(lon, 3), int(radius))
+    now_m = time.monotonic()
+    cached = _wiki_cache.get(grid_key)
+    if cached and cached[1] > now_m:
+        # Tái tính distance_m chính xác cho tọa độ request hiện tại
+        items = [dict(c) for c in cached[0]]
+        for it in items:
+            if it.get("latitude") is not None and it.get("longitude") is not None:
+                it["distance_m"] = round(haversine_m(lat, lon, it["latitude"], it["longitude"]), 1)
+        return items[:limit], True
 
-    with httpx.Client(timeout=WIKI_TIMEOUT) as client:
-        geo = _wiki_request(client, {
-            "action": "query", "list": "geosearch", "gscoord": f"{lat}|{lon}",
-            "gsradius": int(radius), "gsnamespace": 0, "gslimit": limit, "format": "json"})
-        geo_by_id = {g["pageid"]: g for g in geo.get("query", {}).get("geosearch", []) if "pageid" in g}
-        pages = {}
-        if geo_by_id:
-            ext = _wiki_request(client, {
-                "action": "query", "prop": "extracts|info", "exintro": 1, "explaintext": 1,
-                "inprop": "url", "pageids": "|".join(map(str, geo_by_id)), "format": "json"})
-            pages = ext.get("query", {}).get("pages", {})
+    cell_lock = _get_cell_lock(grid_key)
+    with cell_lock:
+        now_m = time.monotonic()
+        cached = _wiki_cache.get(grid_key)
+        if cached and cached[1] > now_m:
+            items = [dict(c) for c in cached[0]]
+            for it in items:
+                if it.get("latitude") is not None and it.get("longitude") is not None:
+                    it["distance_m"] = round(haversine_m(lat, lon, it["latitude"], it["longitude"]), 1)
+            return items[:limit], True
 
-    synced_at = datetime.now(timezone.utc)
-    candidates = [{
-        "source_page_id": p["pageid"], "source_title": p.get("title"),
-        "description_source": p["extract"], "source_url": p.get("fullurl") or p.get("canonicalurl"),
-        "latitude": geo_by_id[p["pageid"]].get("lat"), "longitude": geo_by_id[p["pageid"]].get("lon"),
-        "last_synced_at": synced_at,
-    } for p in pages.values() if p.get("extract") and p.get("pageid") in geo_by_id]
-    now = time.monotonic()
-    for k in [k for k, v in _wiki_cache.items() if v[1] <= now]:  # dọn mục hết hạn, tránh phình RAM
-        _wiki_cache.pop(k, None)
-    _wiki_cache[key] = (candidates, now + WIKI_CACHE_TTL_SECONDS)  # cache cả khi rỗng
-    return candidates, False
+        client = _get_wiki_client()
+        fetch_limit = max(limit * 3, 20)
+
+        # Ưu tiên 1 lượt HTTP: generator=geosearch kết hợp extracts + info + coordinates + categories
+        params = {
+            "action": "query",
+            "generator": "geosearch",
+            "ggscoord": f"{lat}|{lon}",
+            "ggsradius": int(radius),
+            "ggsnamespace": 0,
+            "ggslimit": fetch_limit,
+            "prop": "coordinates|extracts|info|categories",
+            "exintro": 1,
+            "explaintext": 1,
+            "inprop": "url",
+            "cllimit": 15,
+            "format": "json",
+        }
+
+        t_start = time.monotonic()
+        res = _wiki_request(client, params)
+        query_data = res.get("query", {})
+        pages = query_data.get("pages", {})
+
+        # Tương thích nếu upstream/mock trả về kiểu query.geosearch cũ
+        if not pages and "geosearch" in query_data:
+            geo_list = query_data.get("geosearch", [])
+            geo_by_id = {g["pageid"]: g for g in geo_list if "pageid" in g}
+            if geo_by_id:
+                ext = _wiki_request(client, {
+                    "action": "query", "prop": "extracts|info|categories", "exintro": 1, "explaintext": 1,
+                    "inprop": "url", "pageids": "|".join(map(str, geo_by_id)), "cllimit": 15, "format": "json"})
+                pages = ext.get("query", {}).get("pages", {})
+                for pid, p in pages.items():
+                    if pid in geo_by_id:
+                        p["coordinates"] = [{"lat": geo_by_id[pid].get("lat"), "lon": geo_by_id[pid].get("lon")}]
+
+        synced_at = datetime.now(timezone.utc)
+        raw_candidates = []
+
+        for p in pages.values():
+            if not p.get("extract"):
+                continue
+            coords = p.get("coordinates")
+            if not coords or not isinstance(coords, list) or len(coords) == 0:
+                continue
+            p_lat = coords[0].get("lat")
+            p_lon = coords[0].get("lon")
+            if p_lat is None or p_lon is None:
+                continue
+
+            dist = haversine_m(lat, lon, p_lat, p_lon)
+            raw_candidates.append({
+                "source_page_id": p["pageid"],
+                "source_title": p.get("title"),
+                "name": p.get("title"),
+                "description_source": p["extract"],
+                "source_url": p.get("fullurl") or p.get("canonicalurl"),
+                "latitude": p_lat,
+                "longitude": p_lon,
+                "radius": 80.0,
+                "distance_m": round(dist, 1),
+                "categories": [c.get("title", "") for c in p.get("categories", [])],
+                "last_synced_at": synced_at,
+            })
+
+        # Phân loại và xếp hạng: loại bỏ quốc gia, chính thể, sự kiện, con người
+        ranked = rank_candidates(raw_candidates, lat, lon)
+        _wiki_cache[grid_key] = (ranked, time.monotonic() + WIKI_CACHE_TTL_SECONDS)
+
+        duration_ms = round((time.monotonic() - t_start) * 1000, 1)
+        logger.info(
+            f"[Timing] discover wikimedia: raw={len(raw_candidates)}, valid_ranked={len(ranked)}, "
+            f"duration={duration_ms}ms, grid={grid_key}"
+        )
+        return ranked[:limit], False
 
 
 # ============ 4. SCHEMA (Pydantic: JSON vào/ra) ============
@@ -246,6 +353,8 @@ class DiscoverCandidate(BaseModel):
     source_url: Optional[str] = None
     last_synced_at: Optional[datetime] = None
     is_ready: Optional[bool] = None
+    distance_m: Optional[float] = None
+    poi_score: Optional[int] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -329,10 +438,13 @@ def _find_narration(db: Session, location_id: int, requested_lang: str):
 def _ready_languages(db: Session, location_id: int) -> list:
     """Các ngôn ngữ audio_ready còn hạn."""
     db.flush()  # session autoflush=False -> flush tay để đọc đúng
-    return list(db.execute(select(NarrationCache.requested_lang).where(
+    old = list(db.execute(select(NarrationCache.requested_lang).where(
         NarrationCache.location_id == location_id,
         NarrationCache.audio_status == "audio_ready",
         NarrationCache.expires_at > utcnow()).order_by(NarrationCache.requested_lang)).scalars())
+    durable = db.execute(select(Narration.language).where(
+        Narration.location_id == location_id, Narration.status == "ready")).scalars()
+    return sorted(set(old) | set(durable))
 
 
 def _recompute_is_ready(db: Session, location: Location) -> bool:
@@ -347,9 +459,24 @@ def _invalidate_narrations(db: Session, location: Location) -> None:
 
 
 # ============ 5. FASTAPI APP + ROUTES ============
-app = FastAPI(title="content-service")
-run_migrations()                       # DB cũ (tuần 2)
-Base.metadata.create_all(bind=engine)  # DB mới hoàn toàn
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    # Khi dừng service, checkpoint giữ trong DB; request sau lấy lại lease hết hạn.
+    import asyncio
+    tasks = list(narration_pipeline.tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    await narration_pipeline.close()
+
+
+app = FastAPI(title="content-service", lifespan=lifespan)
+if IS_SQLITE:  # Local/test cũ; Supabase phải chạy SQL migration trước khi deploy.
+    run_migrations()
+    Base.metadata.create_all(bind=engine)
+narration_pipeline = NarrationPipeline()
 
 
 def get_db():
@@ -399,26 +526,44 @@ def health_check():
 @app.get("/locations/nearby")
 def locations_nearby(latitude: float = Query(...), longitude: float = Query(...),
                      max_distance: float = Query(500, gt=0), db: Session = Depends(get_db)):
-    """Tìm trong dữ liệu ĐÃ LƯU (không gọi Wikimedia); mọi điểm có GPS trong max_distance."""
+    """Tìm trong dữ liệu ĐÃ LƯU (không gọi Wikimedia); mọi điểm có GPS trong max_distance.
+    Lọc bỏ các bài không phải POI tham quan hợp lệ (quốc gia, chính thể, con người, đơn vị hành chính diện rộng)."""
+    t_start = time.monotonic()
     _check_gps(latitude, longitude)
     rows = db.execute(select(Location).where(
         Location.latitude.isnot(None), Location.longitude.isnot(None))).scalars()
     found = []
     for loc in rows:
+        # Lọc POI hợp lệ
+        is_valid, reason, score = is_valid_travel_poi(
+            loc.name or loc.source_title or "",
+            loc.description_source or loc.description_vi or ""
+        )
+        if not is_valid:
+            continue
         d = haversine_m(latitude, longitude, loc.latitude, loc.longitude)
         if d <= max_distance:
             base = DiscoverCandidate.model_validate(loc).model_dump()
-            found.append(NearbyCandidate(**base, distance_m=d))
+            base["distance_m"] = round(d, 1)
+            base["poi_score"] = score
+            found.append(NearbyCandidate(**base))
     found.sort(key=lambda c: c.distance_m)
+    duration_ms = round((time.monotonic() - t_start) * 1000, 2)
+    logger.info(f"[Timing] nearby: found={len(found)}, duration={duration_ms}ms")
     return {"candidates": [c.model_dump() for c in found]}
 
 
 def _stored_wikimedia_near(db: Session, lat: float, lon: float, radius: float, limit: int):
-    """Bài Wikimedia ĐÃ LƯU trong SQLite nằm trong radius, gần nhất trước."""
+    """Bài Wikimedia ĐÃ LƯU trong SQLite nằm trong radius, gần nhất trước, đã lọc POI."""
     rows = db.execute(select(Location).where(
         Location.source == "wikimedia", Location.latitude.isnot(None),
         Location.longitude.isnot(None))).scalars()
-    pairs = [(haversine_m(lat, lon, r.latitude, r.longitude), r) for r in rows]
+    valid_rows = []
+    for r in rows:
+        is_valid, _, _ = is_valid_travel_poi(r.name or r.source_title or "", r.description_source or "")
+        if is_valid:
+            valid_rows.append(r)
+    pairs = [(haversine_m(lat, lon, r.latitude, r.longitude), r) for r in valid_rows]
     return [r for d, r in sorted((p for p in pairs if p[0] <= radius), key=lambda p: p[0])[:limit]]
 
 
@@ -426,7 +571,8 @@ def _stored_wikimedia_near(db: Session, lat: float, lon: float, radius: float, l
 def locations_discover(latitude: float = Query(...), longitude: float = Query(...),
                        radius: float = Query(500, ge=10, le=10000), limit: int = Query(5, gt=0, le=50),
                        db: Session = Depends(get_db)):
-    """Tìm bài Wikipedia quanh tọa độ rồi UPSERT vào CSDL."""
+    """Tìm bài Wikipedia quanh tọa độ rồi UPSERT vào CSDL, trả kèm khoảng cách distance_m."""
+    t_start = time.monotonic()
     _check_gps(latitude, longitude)
     try:
         raw, cache_hit = wikimedia_discover(latitude, longitude, radius, limit)
@@ -434,12 +580,27 @@ def locations_discover(latitude: float = Query(...), longitude: float = Query(..
         # Upstream lỗi: có dữ liệu đã lưu -> phục vụ (stale, không sửa DB); không có -> 503.
         stored = _stored_wikimedia_near(db, latitude, longitude, radius, limit)
         if stored:
-            return {"candidates": [DiscoverCandidate.model_validate(x).model_dump() for x in stored],
-                    "cache_hit": True, "stale": True, "upstream_error": exc.code}
+            res_items = []
+            for x in stored:
+                d = haversine_m(latitude, longitude, x.latitude, x.longitude)
+                m = DiscoverCandidate.model_validate(x).model_dump()
+                m["distance_m"] = round(d, 1)
+                res_items.append(m)
+            return {"candidates": res_items, "cache_hit": True, "stale": True, "upstream_error": exc.code}
         return JSONResponse(status_code=503,
                             content={"detail": {"code": exc.code, "message": exc.message}})
-    result = [DiscoverCandidate.model_validate(_upsert_wikimedia_location(db, item, not cache_hit)).model_dump()
-              for item in raw]
+
+    result = []
+    for item in raw:
+        loc = _upsert_wikimedia_location(db, item, not cache_hit)
+        if loc:
+            m = DiscoverCandidate.model_validate(loc).model_dump()
+            m["distance_m"] = item.get("distance_m") or round(haversine_m(latitude, longitude, loc.latitude, loc.longitude), 1)
+            m["poi_score"] = item.get("poi_score")
+            result.append(m)
+
+    duration_ms = round((time.monotonic() - t_start) * 1000, 2)
+    logger.info(f"[Timing] discover endpoint: count={len(result)}, cache_hit={cache_hit}, duration={duration_ms}ms")
     return {"candidates": result, "cache_hit": cache_hit}
 
 
@@ -449,9 +610,16 @@ def _find_wikimedia(db: Session, source_page_id: int, source_lang: str = "vi"):
         Location.source_page_id == source_page_id)).scalar_one_or_none()
 
 
-def _upsert_wikimedia_location(db: Session, item: dict, fetched_now: bool = True) -> Location:
+def _upsert_wikimedia_location(db: Session, item: dict, fetched_now: bool = True) -> Optional[Location]:
     """Thêm/cập nhật 1 bài Wikimedia (chống trùng theo pageid).
-    fetched_now=False (chỉ đọc cache 60s): record có sẵn giữ nguyên, không đổi last_synced_at."""
+    Bỏ qua nếu bài viết không phải POI du lịch hợp lệ."""
+    # Kiểm tra POI
+    is_valid, reason, _ = is_valid_travel_poi(
+        item.get("source_title", ""), item.get("description_source", ""), item.get("categories", [])
+    )
+    if not is_valid:
+        return None
+
     existing = _find_wikimedia(db, item["source_page_id"])
     if existing:
         if not fetched_now:
@@ -528,10 +696,42 @@ def update_location(location_id: int, body: LocationCreate, db: Session = Depend
 @app.delete("/locations/{location_id}", dependencies=WRITE)
 def delete_location(location_id: int, db: Session = Depends(get_db)):
     loc = _get_location_or_404(db, location_id)
+    if db.execute(select(Narration.id).where(Narration.location_id == location_id).limit(1)).first():
+        raise HTTPException(409, "Địa điểm đã có thuyết minh lưu lâu dài; giữ lại để bảo toàn dữ liệu")
     db.execute(delete(NarrationCache).where(NarrationCache.location_id == location_id))
     db.delete(loc)
     db.commit()
     return {"deleted": True, "id": location_id}
+
+
+class GenerateNarrationRequest(BaseModel):
+    location_id: int = Field(gt=0)
+    target_lang: str
+    voice: Optional[str] = None
+
+
+@app.post("/narrate")
+async def generate_narration(body: GenerateNarrationRequest):
+    """Client gọi lại qua detect mỗi 10s khi nhận HTTP 202."""
+    import asyncio
+    from sqlalchemy.exc import SQLAlchemyError
+    _check_language(body.target_lang)
+    if IS_SQLITE or not narration_pipeline.clients.configured():
+        raise HTTPException(503, "Cần cấu hình DATABASE_URL PostgreSQL, Gemini và Supabase Storage")
+
+    def load_location():
+        with SessionLocal() as db:
+            return LocationResponse.model_validate(_get_location_or_404(db, body.location_id)).model_dump(mode="json")
+
+    try:
+        location = await asyncio.to_thread(load_location)
+        result = await narration_pipeline.request(location, body.target_lang, body.voice)
+        code = 200 if result["narration_status"] == "audio_ready" else 503 if result["narration_status"] == "error" else 202
+        return JSONResponse(status_code=code, content=result, headers={"Retry-After": "10"})
+    except PipelineError as exc:
+        raise HTTPException(422 if str(exc) == "invalid_voice" else 503, str(exc)) from exc
+    except (SQLAlchemyError, httpx.RequestError):
+        raise HTTPException(503, "narration_storage_unavailable")
 
 
 # --- Narration cache + is_ready ---

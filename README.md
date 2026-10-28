@@ -1,5 +1,11 @@
 # Multilingual Video Dubbing Backend Architecture
 
+> **Cập nhật GPS Audio Guide:** luồng mới do Content Service quản lý:
+> Wikimedia → Gemini → Edge TTS → Supabase PostgreSQL/Storage.
+> Đọc [hướng dẫn cấu hình và vận hành](docs/gemini-supabase.md),
+> chạy [SQL migration Supabase](docs/supabase-schema.sql) trước khi deploy.
+> Các mô tả SQLite/cache MP3 ở phần cũ bên dưới chỉ áp dụng cho chế độ tương thích.
+
 Hệ thống backend xử lý dịch thuật và lồng tiếng video đa ngôn ngữ được thiết kế theo kiến trúc **Microservices**.
 
 ---
@@ -138,4 +144,46 @@ Trong `translate-audio-service` (Port 8002), tính năng chuyển văn bản th�
 4. **Cơ chế Cache bền vững & Tối ưu hóa**:
    - Hệ thống lưu trữ các file MP3 trong thư mục `audio_files/` dựa trên khóa băm SHA256 (`text_chuẩn_hóa + lang + voice + phiên_bản_TTS`).
    - Cùng một nội dung thì tên file luôn không đổi giữa các lần định vị GPS tick, tránh tạo trùng file và giảm thiểu tối đa số lần gọi ra bên ngoài.
-   - Sử dụng khóa đồng thời (`asyncio.Lock`) và ghi đĩa nguyên tử (`atomic rename` từ file tạm sang `.mp3`) để bảo đảm an toàn dữ liệu và tốc độ phản hồi.
+   - Sử dụng khóa đồng thời (`asyncio.Lock`) và ghi đĩa nguyên tử (`atomic rename` từ file tạm sang `.mp3`) để bảo đảm an toàn dữ liệu và tốc độ phản hồi.
+
+---
+
+## 5. Admin Dashboard & Giám Sát Hệ Thống
+
+Dự án tích hợp trang **Admin Dashboard** dành riêng cho Quản trị viên để theo dõi hoạt động hệ thống GPS Audio Guide:
+
+### Các chỉ số theo dõi:
+1. **Khách đang online:** Số lượng trình duyệt có heartbeat hợp lệ trong 90 giây gần nhất (cập nhật tự động mỗi 30s từ client).
+2. **Khách duy nhất 24 giờ & 7 ngày:** Số mã định danh ẩn danh (`Client ID`) hoạt động trong khung thời gian tương ứng.
+3. **Lượt xem trang (Page Views):** Lượt mở giao diện web `/app/` thực tế (loại trừ các request polling, health-check, heartbeat).
+4. **Top địa điểm quan tâm:** Danh sách địa điểm được tìm kiếm hoặc kích hoạt thuyết minh nhiều nhất qua GPS.
+5. **Theo dõi AI & TTS:** Số yêu cầu thuyết minh, tỷ lệ thành công/thất bại, thời gian phản hồi trung bình của Edge TTS, phân bổ ngôn ngữ (`vi`, `en`, `ja`).
+6. **Trạng thái Microservices:** Kiểm tra kết nối nội bộ giữa Gateway, Content Service và Translate Audio Service.
+7. **Nhật ký lỗi (Sanitized Logs):** Ghi nhận các lỗi hệ thống gần nhất với dữ liệu nhạy cảm (IP, password, token) đã được tự động loại bỏ.
+
+### Cấu hình biến môi trường Quản trị trên Render / Local (.env):
+| Biến môi trường | Ý nghĩa | Ví dụ giá trị |
+|-----------------|---------|---------------|
+| `ADMIN_PATH` | Đường dẫn URL quản trị riêng (bảo mật URL) | `/admin-dashboard/` hoặc `/admin-sec-9a8f2/` |
+| `ADMIN_USERNAME` | Tên đăng nhập của quản trị viên | `admin` |
+| `ADMIN_PASSWORD` | Mật khẩu đăng nhập quản trị (cần đặt mạnh) | `MatKhauBaoMatCucManh2026!` |
+| `ADMIN_SESSION_SECRET` | Khóa bí mật dùng ký Session Cookie (HMAC-SHA256) | Chuỗi hex ngẫu nhiên 64 ký tự |
+| `ANALYTICS_DB_PATH` | Đường dẫn lưu CSDL SQLite thống kê | `/app/data/analytics.db` |
+
+> **Cách tạo chuỗi ngẫu nhiên mạnh cho `ADMIN_SESSION_SECRET` và `ADMIN_PATH`:**
+> ```bash
+> python -c "import secrets; print('ADMIN_PATH=/admin-' + secrets.token_hex(4) + '/\nADMIN_SESSION_SECRET=' + secrets.token_hex(32))"
+> ```
+
+### Bảo mật & Quyền riêng tư:
+- Không lưu địa chỉ IP và không lưu lịch sử tọa độ GPS người dùng.
+- Mọi endpoint API quản trị (`/api/summary`, `/api/chart`, `/api/locations`, `/api/errors`) đều yêu cầu Session Cookie hợp lệ (`HttpOnly`, `SameSite=Lax`, `Secure` khi chạy HTTPS). Người chưa đăng nhập sẽ nhận mã `401 Unauthorized`.
+- Tự động khóa IP (Rate-limiting) trong 5 phút nếu nhập sai mật khẩu quá 5 lần liên tiếp.
+
+---
+
+## 6. Lưu ý về Cơ chế Lưu trữ trên Render Free
+
+- **Ephemeral Filesystem:** Trên gói **Render Free Tier**, hệ thống đĩa cứng là tạm thời (ephemeral). Khi dịch vụ khởi động lại (restart) hoặc khi deploy phiên bản mới, dữ liệu trong container có thể được làm mới.
+- Dữ liệu địa điểm trong `content.db` và số liệu thống kê trong `analytics.db` được duy trì ổn định trong suốt vòng đời của container đang hoạt động.
+
