@@ -12,7 +12,7 @@ from pathlib import Path
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from models import IS_SQLITE, Location, SessionLocal
+from models import IS_SQLITE, Location, SessionLocal, as_utc
 
 
 def main():
@@ -35,7 +35,7 @@ def main():
             for item in rows:
                 data = {k: item[k] for k in item.keys() if k in columns}
                 if data.get("last_synced_at"):
-                    data["last_synced_at"] = datetime.fromisoformat(data["last_synced_at"])
+                    data["last_synced_at"] = as_utc(datetime.fromisoformat(data["last_synced_at"]))
                 if data.get("is_ready") is not None:
                     data["is_ready"] = bool(data["is_ready"])
                 # Cache MP3 cũ chưa nằm trên Storage, không xem là ready.

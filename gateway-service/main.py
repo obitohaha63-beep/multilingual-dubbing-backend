@@ -15,6 +15,7 @@ import logging
 import re
 import time
 from pathlib import Path
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -43,7 +44,19 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # Khởi tạo CSDL analytics nếu chưa có
 analytics_store.init_analytics_db()
 
-app = FastAPI(title="gateway-service")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Dọn dữ liệu analytics cũ hơn 30 ngày (gọi analytics_cleanup của migration 001)
+    import asyncio
+    asyncio.create_task(asyncio.to_thread(analytics_store.cleanup_old_analytics, 30))
+    yield
+    global _shared_client
+    if _shared_client is not None and not _shared_client.is_closed:
+        await _shared_client.aclose()
+
+
+app = FastAPI(title="gateway-service", lifespan=lifespan)
 
 @app.get("/", include_in_schema=False)
 def home():
@@ -90,6 +103,7 @@ class DetectRequest(BaseModel):
     language: str
     accuracy_m: Optional[float] = None
     voice: Optional[str] = None
+    client_id: Optional[str] = None
 
     @field_validator("latitude")
     @classmethod
@@ -331,6 +345,17 @@ async def detect_location(req: DetectRequest):
             candidates=None,
         )
 
+    # Ghi nhận sự kiện phát hiện địa điểm ứng viên gần nhất
+    top_cand = valid_candidates[0]
+    analytics_store.record_location_event(
+        location_id=int(top_cand["id"]),
+        location_name=str(top_cand.get("name") or top_cand.get("source_title") or ""),
+        language=req.language,
+        event_type="location_detected",
+        client_id=req.client_id,
+        distance_m=top_cand.get("distance_m"),
+    )
+
     # Có candidates nhưng kiểm tra activation
     if active_candidate:
         # Nằm trong bán kính kích hoạt -> Content điều phối thuyết minh
@@ -339,6 +364,14 @@ async def detect_location(req: DetectRequest):
 
         narrate_payload = {"location_id": int(active_candidate["id"]),
                            "target_lang": req.language, "voice": req.voice}
+
+        # Ghi nhận sự kiện yêu cầu thuyết minh trước khi gọi downstream
+        analytics_store.record_narration_event(
+            location_id=int(active_candidate["id"]),
+            language=req.language,
+            event_type="narration_requested",
+            client_id=req.client_id,
+        )
 
         t_narrate_start = time.monotonic()
         try:
@@ -351,8 +384,8 @@ async def detect_location(req: DetectRequest):
             narrate_ms = round((time.monotonic() - t_narrate_start) * 1000, 1)
             total_ms = round((time.monotonic() - t_detect_start) * 1000, 1)
             # Ghi nhận lỗi và event thất bại
-            analytics_store.record_error_log("content-service", "POST /narrate", str(exc), 503, "NetworkError")
-            analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", status_reason="narrate_unavailable")
+            analytics_store.record_error_log("content-service", "POST /narrate", str(exc), 503, "NetworkError", client_id=req.client_id)
+            analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", status_reason="narrate_unavailable", client_id=req.client_id)
             logger.warning(f"[Timing] detect: total={total_ms}ms narrate_failed ({narrate_ms}ms)")
             return DetectResponse(
                 detected=True,
@@ -399,6 +432,7 @@ async def detect_location(req: DetectRequest):
                 str(active_candidate.get("name") or active_candidate.get("source_title") or ""),
                 req.language,
                 "activated",
+                client_id=req.client_id,
                 distance_m=dist,
             )
             analytics_store.record_narration_event(
@@ -408,6 +442,8 @@ async def detect_location(req: DetectRequest):
                 duration_ms=narrate_ms,
                 is_fallback=b_data.get("is_fallback", False),
                 status_reason=b_data.get("narration_status", "audio_ready"),
+                client_id=req.client_id,
+                cache_hit=b_data.get("cache_hit", False),
             )
 
             return DetectResponse(
@@ -433,8 +469,8 @@ async def detect_location(req: DetectRequest):
             except Exception:
                 detail = narrate_resp.text
 
-            analytics_store.record_error_log("content-service", "POST /narrate", str(detail), narrate_resp.status_code, "UpstreamError")
-            analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", duration_ms=narrate_ms, status_reason=str(detail)[:100])
+            analytics_store.record_error_log("content-service", "POST /narrate", str(detail), narrate_resp.status_code, "UpstreamError", client_id=req.client_id)
+            analytics_store.record_narration_event(int(active_candidate["id"]), req.language, "tts_fail", duration_ms=narrate_ms, status_reason=str(detail)[:100], client_id=req.client_id)
 
             return DetectResponse(
                 detected=True,
@@ -854,7 +890,7 @@ async def admin_login(request: Request):
 
     if not (valid_user and valid_pass):
         admin_auth.record_failed_attempt(client_ip)
-        analytics_store.record_error_log("gateway-service", "ADMIN_LOGIN_FAIL", f"Đăng nhập thất bại cho user: {username}", 401, "AuthFailure")
+        analytics_store.record_error_log("gateway-service", "ADMIN_LOGIN_FAIL", "Admin login failed (invalid credentials)", 401, "AuthFailure")
         return HTMLResponse(
             admin_view.render_login_page(
                 admin_path=f"{ADMIN_BASE}/",

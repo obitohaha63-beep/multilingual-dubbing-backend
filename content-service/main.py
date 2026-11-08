@@ -16,7 +16,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import Base, DB_PATH, IS_SQLITE, Location, Narration, NarrationCache, SessionLocal, engine
+from models import Base, DB_PATH, IS_SQLITE, Location, Narration, NarrationCache, SessionLocal, as_utc, engine
 from narration_clients import PipelineError
 from narration_pipeline import NarrationPipeline
 from poi_filter import is_valid_travel_poi, rank_candidates
@@ -63,6 +63,9 @@ def _migrate_v3(conn):
         audio_status VARCHAR NOT NULL, created_at DATETIME NOT NULL,
         updated_at DATETIME NOT NULL, expires_at DATETIME NOT NULL,
         CONSTRAINT ux_narration_location_lang UNIQUE (location_id, requested_lang))""")
+    have = {r[1] for r in conn.execute("PRAGMA table_info(narration_cache)")}
+    if "narration_id" not in have:
+        conn.execute("ALTER TABLE narration_cache ADD COLUMN narration_id TEXT")
 
 
 MIGRATIONS = {2: _migrate_v2, 3: _migrate_v3}  # thêm version mới = thêm 1 dòng
@@ -128,6 +131,12 @@ _shared_wiki_client: Optional[httpx.Client] = None
 _wiki_client_lock = threading.Lock()
 _wiki_cell_locks: Dict[tuple, threading.Lock] = {}
 _cell_locks_guard = threading.Lock()
+
+
+def _prune_wiki_cache(now_m: float) -> None:
+    expired = [k for k, v in _wiki_cache.items() if v[1] <= now_m]
+    for k in expired:
+        _wiki_cache.pop(k, None)
 
 
 def _get_wiki_client() -> httpx.Client:
@@ -199,6 +208,7 @@ def wikimedia_discover(lat: float, lon: float, radius: float, limit: int):
     """
     grid_key = (round(lat, 3), round(lon, 3), int(radius))
     now_m = time.monotonic()
+    _prune_wiki_cache(now_m)
     cached = _wiki_cache.get(grid_key)
     if cached and cached[1] > now_m:
         # Tái tính distance_m chính xác cho tọa độ request hiện tại
@@ -367,8 +377,8 @@ AUDIO_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.mp3$", re.IG
 
 
 def utcnow() -> datetime:
-    """Giờ UTC không tzinfo (SQLite lưu datetime không múi giờ)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    """Giờ UTC có tzinfo (tương thích cả PostgreSQL TIMESTAMPTZ và SQLite)."""
+    return datetime.now(timezone.utc)
 
 
 def narration_ttl() -> timedelta:
@@ -426,7 +436,7 @@ class NarrationPut(BaseModel):
 
 
 def narration_to_dict(n: NarrationCache) -> dict:
-    return {c.name: getattr(n, c.name) for c in NarrationCache.__table__.columns if c.name != "id"}
+    return {c.name: getattr(n, c.name) for c in NarrationCache.__table__.columns if c.name not in ("id", "narration_id")}
 
 
 def _find_narration(db: Session, location_id: int, requested_lang: str):
@@ -438,12 +448,13 @@ def _find_narration(db: Session, location_id: int, requested_lang: str):
 def _ready_languages(db: Session, location_id: int) -> list:
     """Các ngôn ngữ audio_ready còn hạn."""
     db.flush()  # session autoflush=False -> flush tay để đọc đúng
+    now_dt = utcnow()
     old = list(db.execute(select(NarrationCache.requested_lang).where(
         NarrationCache.location_id == location_id,
         NarrationCache.audio_status == "audio_ready",
-        NarrationCache.expires_at > utcnow()).order_by(NarrationCache.requested_lang)).scalars())
-    durable = db.execute(select(Narration.language).where(
-        Narration.location_id == location_id, Narration.status == "ready")).scalars()
+        NarrationCache.expires_at > now_dt).order_by(NarrationCache.requested_lang)).scalars())
+    durable = list(db.execute(select(Narration.language).where(
+        Narration.location_id == location_id, Narration.status == "ready")).scalars())
     return sorted(set(old) | set(durable))
 
 
@@ -455,7 +466,7 @@ def _recompute_is_ready(db: Session, location: Location) -> bool:
 
 def _invalidate_narrations(db: Session, location: Location) -> None:
     db.execute(delete(NarrationCache).where(NarrationCache.location_id == location.id))
-    location.is_ready = False
+    _recompute_is_ready(db, location)
 
 
 # ============ 5. FASTAPI APP + ROUTES ============
@@ -740,7 +751,7 @@ def get_narration(location_id: int, language: str, db: Session = Depends(get_db)
     _get_location_or_404(db, location_id)
     _check_language(language)
     row = _find_narration(db, location_id, language)
-    if row is None or row.expires_at <= utcnow():  # chưa có hoặc hết hạn = miss
+    if row is None or as_utc(row.expires_at) <= as_utc(utcnow()):  # chưa có hoặc hết hạn = miss
         return {"cache_hit": False, "narration": None}
     return {"cache_hit": True, "narration": narration_to_dict(row)}
 
@@ -759,11 +770,20 @@ def put_narration(location_id: int, language: str, body: NarrationPut, db: Sessi
     expires_at = body.expires_at
     if expires_at is not None:
         if expires_at.tzinfo is not None:
-            expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
-        if expires_at <= now:
+            expires_at = expires_at.astimezone(timezone.utc)
+        if as_utc(expires_at) <= as_utc(now):
             raise HTTPException(422, "expires_at phải ở tương lai")
     values = body.model_dump(exclude={"requested_lang", "expires_at"})
     values.update(expires_at=expires_at or now + narration_ttl(), updated_at=now)
+
+    # Liên kết narration_id nếu đã có bản thuyết minh durable tương ứng
+    durable_id = db.execute(select(Narration.id).where(
+        Narration.location_id == location_id,
+        Narration.language == language,
+        Narration.status == "ready"
+    ).limit(1)).scalar_one_or_none()
+    if durable_id:
+        values["narration_id"] = durable_id
 
     def save(row):
         for k, v in values.items():
