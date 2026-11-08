@@ -6,12 +6,12 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from models import Location, Narration, SessionLocal
+from models import Location, Narration, SessionLocal, as_utc
 from narration_clients import RETRYABLE_CODES
 
 
-def now():
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+def now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def as_dict(row):
@@ -58,7 +58,7 @@ class NarrationStore:
             row = db.execute(select(Narration).filter_by(**key)).scalar_one()
             result = as_dict(row)
             # Worker chết ở lần cuối: vẫn phải trả trạng thái lỗi sau khi hết lease.
-            if result["status"] == "processing" and result["lease_until"] <= current:
+            if result["status"] == "processing" and as_utc(result["lease_until"]) <= as_utc(current):
                 db.execute(update(Narration).where(Narration.id == row.id,
                     Narration.status == "processing", Narration.lease_until <= current)
                     .values(status="failed", error_code="attempts_exhausted", updated_at=current))
@@ -67,11 +67,12 @@ class NarrationStore:
 
     def save(self, row, **values):
         """Checkpoint chỉ được ghi bởi worker còn giữ lease hợp lệ."""
+        current = now()
         with self.sessions.begin() as db:
             result = db.execute(update(Narration).where(
                 Narration.id == row["id"], Narration.lease_token == row["lease_token"],
-                Narration.status == "processing", Narration.lease_until > now()
-            ).values(**values, updated_at=now()))
+                Narration.status == "processing", Narration.lease_until > current
+            ).values(**values, updated_at=current))
             if result.rowcount != 1:
                 raise RuntimeError("lease_lost")
             if values.get("status") == "ready":
@@ -80,8 +81,9 @@ class NarrationStore:
 
     def invalidate_audio(self, row):
         """Chỉ hạ ready nếu Storage xác nhận file mất; không xóa văn bản/version."""
+        current = now()
         with self.sessions.begin() as db:
             db.execute(update(Narration).where(
                 Narration.id == row["id"], Narration.status == "ready",
                 Narration.updated_at == row["updated_at"]
-            ).values(status="pending", attempts=0, updated_at=now()))
+            ).values(status="pending", attempts=0, updated_at=current))

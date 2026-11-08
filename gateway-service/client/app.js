@@ -740,6 +740,7 @@ class TourStateManager {
       longitude: reqContext.fix.longitude,
       language: reqContext.lang,
       accuracy_m: reqContext.fix.accuracy,
+      client_id: anonClientId,
     };
 
     // Timeout ngân sách: Client abort 40s
