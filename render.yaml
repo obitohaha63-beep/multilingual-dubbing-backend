@@ -52,6 +52,10 @@ services:
         value: "en-US-JennyNeural"
       - key: TTS_VOICE_JA
         value: "ja-JP-NanamiNeural"
+      - key: TTS_VOICE_FR
+        value: "fr-FR-DeniseNeural"
+      - key: TTS_VOICE_ES
+        value: "es-ES-ElviraNeural"
       # --- Cau hinh Gateway ---
       - key: GATEWAY_TIMEOUT
         value: "6.0"

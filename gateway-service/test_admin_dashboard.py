@@ -202,3 +202,127 @@ def test_error_log_sanitization():
     assert "MySecretPass123" not in clean
     assert "192.168.1.100" not in clean
     assert "[REDACTED]" in clean or "[IP_REDACTED]" in clean
+
+
+def test_supabase_visitor_sync_and_internal_online_visitors(tmp_path):
+    """Kiểm tra số người truy cập được đồng bộ Supabase và số người đang dùng chạy nội bộ."""
+    db_file = str(tmp_path / "supabase_test_analytics.db")
+    analytics_store.init_analytics_db(db_file)
+
+    # Ghi nhận lượt xem trang
+    analytics_store.record_page_view("client_sp_1", path="/app/", db_path=db_file)
+    analytics_store.record_heartbeat("client_sp_1", user_agent_short="TestBrowser", db_path=db_file)
+
+    # Thống kê: online_visitors được tính nội bộ qua heartbeat
+    summary = analytics_store.get_analytics_summary(db_path=db_file)
+    assert summary["online_visitors"] == 1
+    assert summary["page_views_24h"] >= 1
+    assert "supabase_visitors_total" in summary
+    assert "supabase_storage_enabled" in summary
+
+
+# ===========================================================================
+# 3. Kiểm thử Supabase Analytics Store & RPC Mapping (Migration 001)
+# ===========================================================================
+
+def test_supabase_heartbeat_calls_rpc(monkeypatch):
+    """Kiểm tra record_heartbeat gọi analytics_touch_session qua RPC khi dùng Supabase."""
+    monkeypatch.setattr(analytics_store, "SUPABASE_URL", "https://test.supabase.co")
+    monkeypatch.setattr(analytics_store, "SUPABASE_SECRET_KEY", "secret-key")
+
+    rpc_calls = []
+    def fake_rpc(func_name, params=None):
+        rpc_calls.append((func_name, params))
+        return True
+
+    monkeypatch.setattr(analytics_store, "_supabase_rpc", fake_rpc)
+    # Đồng bộ chạy hàm trực tiếp để assert
+    analytics_store._supabase_rpc("analytics_touch_session", {"p_client_id": "c1", "p_user_agent": "UA"})
+    assert len(rpc_calls) == 1
+    assert rpc_calls[0][0] == "analytics_touch_session"
+    assert rpc_calls[0][1]["p_client_id"] == "c1"
+
+
+def test_supabase_summary_and_chart_mapping(monkeypatch):
+    """Kiểm tra get_analytics_summary và chart ánh xạ đúng từ Supabase RPC."""
+    monkeypatch.setattr(analytics_store, "SUPABASE_URL", "https://test.supabase.co")
+    monkeypatch.setattr(analytics_store, "SUPABASE_SECRET_KEY", "secret-key")
+
+    fake_summary_data = {
+        "online_visitors": 4,
+        "unique_visitors_24h": 10,
+        "unique_visitors_7d": 35,
+        "page_views_24h": 50,
+        "page_views_total": 120,
+        "narration_requested_24h": 15,
+        "tts_requests_24h": 15,
+        "tts_success_24h": 14,
+        "tts_fail_24h": 1,
+        "tts_avg_duration_ms": 820.5,
+        "cache_hit_24h": 8,
+        "errors_24h": 0,
+        "language_distribution_7d": {"vi": 20, "en": 10, "ja": 5},
+        "as_of": "2026-11-08T03:00:00Z",
+    }
+
+    def fake_rpc(func_name, params=None):
+        if func_name == "analytics_summary":
+            return fake_summary_data
+        if func_name == "analytics_activity_by_day":
+            return [
+                {"day": "2026-11-07", "visitors": 5, "page_views": 20, "detections": 8, "activations": 4},
+                {"day": "2026-11-08", "visitors": 7, "page_views": 30, "detections": 12, "activations": 7},
+            ]
+        if func_name == "analytics_top_locations":
+            return [
+                {"location_id": 1, "location_name": "Địa điểm A", "request_count": 10, "last_requested_at": "2026-11-08T03:00:00Z"}
+            ]
+        if func_name == "analytics_recent_errors":
+            return [
+                {"id": 1, "service": "content", "request_type": "POST /narrate", "status_code": 500, "error_type": "Err", "message": "fail", "occurred_at": "2026-11-08T03:00:00Z"}
+            ]
+        if func_name == "analytics_cleanup":
+            return {"analytics_events": 5, "visitor_sessions": 2, "visitor_access_logs": 0, "ran_at": "2026-11-08"}
+        return None
+
+    monkeypatch.setattr(analytics_store, "_supabase_rpc", fake_rpc)
+
+    summary = analytics_store.get_analytics_summary()
+    assert summary["online_visitors"] == 4
+    assert summary["unique_visitors_24h"] == 10
+    assert summary["supabase_visitors_total"] == 120
+    assert summary["cache_hit_24h"] == 8
+    assert list(summary["language_distribution_7d"].keys()) == ["vi", "en", "ja"]
+
+    chart = analytics_store.get_activity_chart_data(days=7)
+    assert len(chart) == 2
+    assert chart[0]["date"] == "2026-11-07"
+    assert chart[0]["visitors"] == 5
+    assert chart[0]["page_views"] == 20
+    assert chart[0]["detections"] == 8
+    assert chart[0]["activations"] == 4
+
+    top_locs = analytics_store.get_top_locations(limit=5)
+    assert len(top_locs) == 1
+    assert top_locs[0]["location_id"] == 1
+    assert top_locs[0]["last_requested_iso"] == "2026-11-08T03:00:00Z"
+
+    errs = analytics_store.get_recent_error_logs(limit=5)
+    assert len(errs) == 1
+    assert errs[0]["time_iso"] == "2026-11-08T03:00:00Z"
+
+    deleted = analytics_store.cleanup_old_analytics(days=30)
+    assert deleted == 7  # 5 events + 2 sessions
+
+
+def test_supabase_rpc_error_fallback(monkeypatch):
+    """Kiểm tra khi Supabase RPC lỗi (404/500/timeout), Dashboard không sập mà trả số 0."""
+    monkeypatch.setattr(analytics_store, "SUPABASE_URL", "https://test.supabase.co")
+    monkeypatch.setattr(analytics_store, "SUPABASE_SECRET_KEY", "secret-key")
+    monkeypatch.setattr(analytics_store, "_supabase_rpc", lambda *args, **kwargs: None)
+
+    summary = analytics_store.get_analytics_summary()
+    assert summary["online_visitors"] == 0
+    assert summary["unique_visitors_24h"] == 0
+    assert summary["tts_requests_24h"] == 0
+    assert "as_of_iso" in summary

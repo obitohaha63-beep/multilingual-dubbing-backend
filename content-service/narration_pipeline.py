@@ -16,7 +16,13 @@ import httpx
 from narration_clients import NarrationClients, PipelineError, RETRYABLE_CODES
 from narration_store import NarrationStore, now
 
-DEFAULT_VOICES = {"vi": "vi-VN-HoaiMyNeural", "en": "en-US-JennyNeural", "ja": "ja-JP-NanamiNeural"}
+DEFAULT_VOICES = {
+    "vi": "vi-VN-HoaiMyNeural",
+    "en": "en-US-JennyNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "fr": "fr-FR-DeniseNeural",
+    "es": "es-ES-ElviraNeural",
+}
 
 
 def choose_voice(language, voice=None):

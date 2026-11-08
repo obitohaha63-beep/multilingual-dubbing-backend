@@ -422,11 +422,87 @@ body {
   line-height: 1.3;
 }
 
+/* Audio Timeline & Seek Bar */
+.audio-timeline-container {
+  margin-top: 12px;
+  background: rgba(15, 23, 42, 0.7);
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+}
+
+.timeline-time-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  font-size: 0.8rem;
+}
+
+.timeline-title {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.time-label {
+  color: var(--primary);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.slider-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.timeline-slider {
+  width: 100%;
+  height: 6px;
+  border-radius: 4px;
+  background: #334155;
+  outline: none;
+  cursor: pointer;
+  accent-color: var(--primary);
+  transition: all 0.2s ease;
+}
+
+.timeline-slider:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.timeline-slider:hover:not(:disabled) {
+  height: 8px;
+}
+
 /* Player Control Buttons */
 .player-controls {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 12px;
+}
+
+.player-controls .btn {
+  flex: 1 1 calc(33.333% - 8px);
+  min-width: 90px;
+  padding: 8px 10px;
+  font-size: 0.82rem;
+  text-align: center;
+  justify-content: center;
+}
+
+.btn-secondary-outline {
+  background-color: transparent;
+  color: #cbd5e1;
+  border: 1px solid #475569;
+}
+
+.btn-secondary-outline:hover:not(:disabled) {
+  background-color: rgba(148, 163, 184, 0.15);
+  color: #f8fafc;
 }
 
 .btn-warning {

@@ -25,7 +25,7 @@ import httpx
 # ---------------------------------------------------------------------------
 # Allowlist ngôn ngữ được phép — KHÔNG thêm lang code tùy ý từ input user.
 # ---------------------------------------------------------------------------
-ALLOWED_LANGS = {"vi", "en", "ja"}
+ALLOWED_LANGS = {"vi", "en", "ja", "fr", "es"}
 
 
 class WikimediaError(Exception):

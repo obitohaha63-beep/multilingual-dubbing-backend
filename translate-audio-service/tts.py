@@ -54,7 +54,7 @@ logger = logging.getLogger("uvicorn.error.translate_audio.tts")
 VI_VOICES = ("vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural")
 
 # Danh sách ngôn ngữ được hỗ trợ
-ALLOWED_LANGS = {"vi", "en", "ja"}
+ALLOWED_LANGS = {"vi", "en", "ja", "fr", "es"}
 
 # Giới hạn độ dài văn bản
 MAX_TEXT_LENGTH = 1200
@@ -64,6 +64,8 @@ DEFAULT_VOICES: Dict[str, str] = {
     "vi": "vi-VN-HoaiMyNeural",
     "en": "en-US-JennyNeural",
     "ja": "ja-JP-NanamiNeural",
+    "fr": "fr-FR-DeniseNeural",
+    "es": "es-ES-ElviraNeural",
 }
 
 # Cấu hình từ môi trường

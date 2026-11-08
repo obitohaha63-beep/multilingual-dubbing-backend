@@ -133,7 +133,7 @@ class NarrationClients:
 
     async def source(self, client, location):
         lang = location.get("source_lang") or "vi"
-        if lang not in {"vi", "en", "ja"}:
+        if lang not in {"vi", "en", "ja", "fr", "es"}:
             raise PipelineError("unsupported_source_language")
         page_id = location.get("source_page_id")
         params = {"action": "query", "prop": "extracts|info", "exintro": 1,
@@ -167,7 +167,7 @@ class NarrationClients:
                 raise PipelineError("source_invalid_text", "no_readable_text")
             if len(source) > 12000:
                 raise PipelineError("source_too_long", f"length={len(source)}")
-            if language not in {"vi", "en", "ja"}:
+            if language not in {"vi", "en", "ja", "fr", "es"}:
                 raise PipelineError("unsupported_language")
             if not re.fullmatch(r"[A-Za-z0-9._-]+", self.model):
                 raise PipelineError("gemini_invalid_model")
@@ -180,7 +180,7 @@ class NarrationClients:
             self.diagnostic("configuration_error", job_id=job_id, model=self.model, api_key_present=False)
             raise PipelineError("gemini_auth_error", "GEMINI_API_KEY is not configured")
 
-        languages = {"vi": "tiếng Việt", "en": "English", "ja": "日本語"}
+        languages = {"vi": "tiếng Việt", "en": "English", "ja": "日本語", "fr": "français", "es": "español"}
         target_language_name = languages.get(language, language)
         instruction = (
             f"Viết lời thuyết minh du lịch bằng {target_language_name}, tối đa {min(self.target_chars, 1050)} ký tự kể cả khoảng trắng, "
@@ -255,8 +255,10 @@ class NarrationClients:
                     parts = content.get("parts", [])
                     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                     checked = check_text(text)
+                    duration_ms = round((time.monotonic() - started) * 1000)
                     self.diagnostic("validated", model=self.model, job_id=job_id,
                                     output_length=len(checked), response_status="valid")
+                    logger.info(f"[Timing] Gemini: duration={duration_ms}ms, job_id={job_id}, model={self.model}, chars={len(checked)}")
                     return checked
                 except PipelineError as exc:
                     self.diagnostic("output_rejected", model=self.model, job_id=job_id,
@@ -310,6 +312,7 @@ class NarrationClients:
 
     async def speech(self, client, row):
         # Edge owns its bounded retries. Do not multiply three Edge attempts by HTTP retries.
+        t_start = time.monotonic()
         try:
             response = await client.post(f"{self.tts_url}/text-to-speech",
                 json={"text": check_text(row["final_text"]), "lang": row["language"], "voice": row["voice"]},
@@ -337,6 +340,8 @@ class NarrationClients:
             if (data["voice"] not in allowed_voices or data["text_hash"] != expected
                     or data.get("requested_voice", row["voice"]) != row["voice"]):
                 raise PipelineError("tts_text_mismatch")
+            duration_ms = round((time.monotonic() - t_start) * 1000, 1)
+            logger.info(f"[Timing] TTS: duration={duration_ms}ms, lang={row['language']}, voice={data.get('voice')}")
             return {"audio_filename": filename, "voice": data["voice"]}
         except (ValueError, KeyError, TypeError) as exc:
             raise PipelineError("tts_invalid_response") from exc

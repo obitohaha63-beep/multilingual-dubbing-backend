@@ -8,6 +8,9 @@ Model dia diem, cache API cu va ban thuyet minh luu lau dai.
 
 import os
 
+from datetime import datetime, timezone
+from typing import Optional
+
 from sqlalchemy import (
     create_engine,
     Column,
@@ -154,6 +157,19 @@ SessionLocal = sessionmaker(
 Base = declarative_base()
 
 
+def as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    Chuan hoa datetime ve UTC co mui gio (timezone-aware).
+    Ho tro ca datetime naive (SQLite / truoc migration 002)
+    va datetime aware (PostgreSQL TIMESTAMPTZ / sau migration 002).
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 # ============================================================
 # 5. MODEL LOCATION
 # ============================================================
@@ -186,7 +202,7 @@ class Location(Base):
     # Toa do va ban kinh kich hoat audio.
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
-    radius = Column(Float, nullable=True)
+    radius = Column(Float, nullable=True, default=80)
 
     # Thong tin nguon du lieu.
     source_lang = Column(String, nullable=True)
@@ -195,7 +211,7 @@ class Location(Base):
     source_page_id = Column(Integer, nullable=True)
     source_url = Column(String, nullable=True)
 
-    last_synced_at = Column(DateTime, nullable=True)
+    last_synced_at = Column(DateTime(timezone=True), nullable=True)
     is_ready = Column(Boolean, nullable=True, default=False)
 
     __table_args__ = (
@@ -245,6 +261,12 @@ class NarrationCache(Base):
         nullable=False,
     )
 
+    narration_id = Column(
+        String,
+        ForeignKey("narrations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     requested_lang = Column(String, nullable=False)
     lang = Column(String, nullable=False)
 
@@ -261,9 +283,9 @@ class NarrationCache(Base):
 
     audio_status = Column(String, nullable=False)
 
-    created_at = Column(DateTime, nullable=False)
-    updated_at = Column(DateTime, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
         UniqueConstraint(
@@ -321,13 +343,13 @@ class Narration(Base):
     attempts = Column(Integer, nullable=False, default=0)
 
     lease_token = Column(String, nullable=True)
-    lease_until = Column(DateTime, nullable=True)
-    retry_at = Column(DateTime, nullable=True)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    retry_at = Column(DateTime(timezone=True), nullable=True)
 
     error_code = Column(String, nullable=True)
 
-    created_at = Column(DateTime, nullable=False)
-    updated_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
         UniqueConstraint(

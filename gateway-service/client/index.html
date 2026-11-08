@@ -23,6 +23,8 @@
             <option value="vi" selected>🇻🇳 Tiếng Việt</option>
             <option value="en">🇬🇧 English</option>
             <option value="ja">🇯🇵 日本語</option>
+            <option value="fr">🇫🇷 Français</option>
+            <option value="es">🇪🇸 Español</option>
           </select>
         </div>
       </section>
@@ -138,15 +140,36 @@
           </button>
         </div>
 
-        <!-- Nút điều khiển Audio Player -->
+        <!-- Thanh chỉnh thời lượng và tiến trình thuyết minh (Timeline Slider) -->
+        <div class="audio-timeline-container">
+          <div class="timeline-time-row">
+            <span id="audio-current-time" class="time-label mono">00:00</span>
+            <span class="timeline-title">Điều chỉnh thời lượng thuyết minh</span>
+            <span id="audio-duration" class="time-label mono">00:00</span>
+          </div>
+          <div class="slider-wrapper">
+            <input type="range" id="audio-seek-bar" class="timeline-slider" min="0" max="100" value="0" step="0.1" disabled aria-label="Chỉnh thời lượng khi thuyết minh">
+          </div>
+        </div>
+
+        <!-- Cụm nút điều khiển Audio Player và tua thời lượng -->
         <div class="player-controls">
-          <button id="btn-audio-stop" class="btn btn-danger-outline" type="button" disabled>
+          <button id="btn-audio-rewind" class="btn btn-secondary-outline" type="button" disabled title="Tua lùi 10 giây">
+            ⏪ -10s
+          </button>
+          <button id="btn-audio-play-pause" class="btn btn-primary" type="button" disabled title="Tạm dừng / Tiếp tục">
+            ⏸ Tạm dừng
+          </button>
+          <button id="btn-audio-forward" class="btn btn-secondary-outline" type="button" disabled title="Tua tới 10 giây">
+            +10s ⏩
+          </button>
+          <button id="btn-audio-stop" class="btn btn-danger-outline" type="button" disabled title="Dừng phát">
             ⏹ Dừng phát
           </button>
-          <button id="btn-audio-mute" class="btn btn-secondary" type="button">
+          <button id="btn-audio-mute" class="btn btn-secondary" type="button" title="Bật/Tắt tiếng">
             🔇 Tắt tiếng
           </button>
-          <button id="btn-audio-replay" class="btn btn-primary-outline" type="button" disabled>
+          <button id="btn-audio-replay" class="btn btn-primary-outline" type="button" disabled title="Phát lại từ đầu">
             🔁 Phát lại
           </button>
         </div>
