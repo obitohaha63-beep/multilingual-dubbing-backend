@@ -435,8 +435,21 @@ def test_narrate_through_real_tts_endpoint(setup_pipeline, tmp_path, monkeypatch
     from pathlib import Path
     pipeline, _, apis, sessions = setup_pipeline
     root = Path(__file__).resolve().parents[1]
-    spec_content = importlib.util.spec_from_file_location("content_main_app", root / "content-service/main.py")
+    spec_content = importlib.util.spec_from_file_location(
+        "content_main_app",
+        root / "content-service/main.py",
+    )
+
     content_app = importlib.util.module_from_spec(spec_content)
+
+    # Đăng ký module trước khi thực thi để Pydantic
+    # có thể resolve các type annotations.
+    monkeypatch.setitem(
+        sys.modules,
+        spec_content.name,
+        content_app,
+    )
+
     spec_content.loader.exec_module(content_app)
     audio_dir = tmp_path / "edge-audio"
     audio_dir.mkdir()
@@ -504,4 +517,10 @@ def test_narrate_through_real_tts_endpoint(setup_pipeline, tmp_path, monkeypatch
                 assert len(voices) == 3 and apis.calls["gemini"] == 1
         await pipeline.close()
     asyncio.run(run())
+
+
+if __name__ == "__main__":
+    import pytest
+    import sys
+    sys.exit(pytest.main([__file__] + sys.argv[1:]))
 
