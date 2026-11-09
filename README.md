@@ -168,7 +168,10 @@ Dự án tích hợp trang **Admin Dashboard** dành riêng cho Quản trị vi�
 | `ADMIN_USERNAME` | Tên đăng nhập của quản trị viên | `admin` |
 | `ADMIN_PASSWORD` | Mật khẩu đăng nhập quản trị (cần đặt mạnh) | `MatKhauBaoMatCucManh2026!` |
 | `ADMIN_SESSION_SECRET` | Khóa bí mật dùng ký Session Cookie (HMAC-SHA256) | Chuỗi hex ngẫu nhiên 64 ký tự |
-| `ANALYTICS_DB_PATH` | Đường dẫn lưu CSDL SQLite thống kê | `/app/data/analytics.db` |
+| `SUPABASE_URL` | URL kết nối dự án Supabase | `https://your-project.supabase.co` |
+| `SUPABASE_SECRET_KEY` | Khóa service_role gọi RPC và phân tích | `sb_secret_...` |
+| `DATABASE_URL` | Chuỗi kết nối PostgreSQL Supabase (Session Pooler) | `postgresql+psycopg://postgres...` |
+| `ANALYTICS_DB_PATH` | (Tùy chọn) Đường dẫn SQLite fallback khi chạy offline/test | `/app/data/analytics.db` |
 
 > **Cách tạo chuỗi ngẫu nhiên mạnh cho `ADMIN_SESSION_SECRET` và `ADMIN_PATH`:**
 > ```bash
@@ -182,8 +185,9 @@ Dự án tích hợp trang **Admin Dashboard** dành riêng cho Quản trị vi�
 
 ---
 
-## 6. Lưu ý về Cơ chế Lưu trữ trên Render Free
+## 6. Cơ Chế Lưu Trữ Dữ Liệu Bền Vững (Supabase Persistence)
 
-- **Ephemeral Filesystem:** Trên gói **Render Free Tier**, hệ thống đĩa cứng là tạm thời (ephemeral). Khi dịch vụ khởi động lại (restart) hoặc khi deploy phiên bản mới, dữ liệu trong container có thể được làm mới.
-- Dữ liệu địa điểm trong `content.db` và số liệu thống kê trong `analytics.db` được duy trì ổn định trong suốt vòng đời của container đang hoạt động.
-
+- **Cơ sở dữ liệu đám mây Supabase PostgreSQL 16**: Lưu trữ bền vững 6 bảng dữ liệu chuẩn hóa (`locations`, `narrations`, `narration_cache`, `visitor_sessions`, `analytics_events`, `visitor_access_logs`). Toàn bộ số liệu thống kê, bài viết Wikipedia và bản thuyết minh tồn tại vĩnh viễn, không phụ thuộc vào ephemeral disk của Render.
+- **Supabase Storage Bucket `narration-audio`**: Toàn bộ file âm thanh MP3 được lưu trữ trên bucket riêng tư (Private Bucket), bảo vệ bằng cơ chế URL ký động (Signed URLs với TTL 3600 giây).
+- **Tài liệu chi tiết**: Xem [Tài liệu ERD và Kiến trúc Cơ sở dữ liệu](docs/database-erd-and-architecture.md) và [Schema Supabase](docs/supabase-schema.sql).
+- **Script chuyển dữ liệu lịch sử**: [scripts/migrate_sqlite_to_supabase.py](scripts/migrate_sqlite_to_supabase.py).

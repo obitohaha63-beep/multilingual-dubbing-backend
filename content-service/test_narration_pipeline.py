@@ -433,9 +433,11 @@ def test_narrate_through_real_tts_endpoint(setup_pipeline, tmp_path, monkeypatch
     import sys
     from unittest.mock import AsyncMock
     from pathlib import Path
-    import main as content_app
     pipeline, _, apis, sessions = setup_pipeline
     root = Path(__file__).resolve().parents[1]
+    spec_content = importlib.util.spec_from_file_location("content_main_app", root / "content-service/main.py")
+    content_app = importlib.util.module_from_spec(spec_content)
+    spec_content.loader.exec_module(content_app)
     audio_dir = tmp_path / "edge-audio"
     audio_dir.mkdir()
     monkeypatch.setenv("AUDIO_DIR", str(audio_dir))
