@@ -288,6 +288,25 @@ body {
   text-decoration: underline;
 }
 
+#source-link-row {
+  gap: 10px;
+}
+
+#source-link-row .meta-key {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+#place-url {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+}
+
 .narration-preview {
   background-color: #0f172a;
   padding: 10px;

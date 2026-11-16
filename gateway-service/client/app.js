@@ -822,7 +822,12 @@ class TourStateManager {
       if (data.source_url) {
         sourceLinkRow.style.display = "flex";
         placeUrl.href = data.source_url;
-        placeUrl.textContent = data.source_url;
+        placeUrl.title = data.source_url;
+        try {
+          placeUrl.textContent = decodeURI(data.source_url);
+        } catch (_) {
+          placeUrl.textContent = data.source_url;
+        }
       } else {
         sourceLinkRow.style.display = "none";
       }
@@ -850,7 +855,12 @@ class TourStateManager {
       if (data.source_url) {
         sourceLinkRow.style.display = "flex";
         placeUrl.href = data.source_url;
-        placeUrl.textContent = data.source_url;
+        placeUrl.title = data.source_url;
+        try {
+          placeUrl.textContent = decodeURI(data.source_url);
+        } catch (_) {
+          placeUrl.textContent = data.source_url;
+        }
       } else {
         sourceLinkRow.style.display = "none";
       }
