@@ -358,6 +358,7 @@ async def detect_location(req: DetectRequest):
 
     # Có candidates nhưng kiểm tra activation
     if active_candidate:
+        logger.info("ALERT: hello")
         # Nằm trong bán kính kích hoạt -> Content điều phối thuyết minh
         dist = active_candidate.get("distance_m")
         source_url = active_candidate.get("source_url")
