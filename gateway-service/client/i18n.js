@@ -55,6 +55,7 @@
     ["Không tìm thấy địa điểm nào trong phạm vi 500m.", "No places found within 500 m.", "500m以内に場所が見つかりません。"],
     ["Chưa có dữ liệu ứng viên trong 500m.", "No nearby places within 500 m yet.", "500m以内の候補はまだありません。"],
     ["Chưa có dữ liệu ứng viên.", "No nearby places yet.", "周辺の候補はまだありません。"],
+    ["Gần nhất", "Nearest", "最も近い"],
     ["Bán kính kích hoạt:", "Activation radius:", "案内範囲:"], ["Nguồn:", "Source:", "情報源:"],
     ["Đang nhận GPS", "Receiving GPS", "GPS受信中"],
     ["GPS chưa ổn định", "GPS unstable", "GPSが不安定です"], ["(Kém)", "(Poor)", "（低精度）"],
