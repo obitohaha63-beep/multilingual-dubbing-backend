@@ -808,6 +808,7 @@ class TourStateManager {
     renderCandidates(data.candidates);
 
     if (data.detected && data.location) {
+      alert("hello");
       noDetectBox.classList.add("hidden");
       detectedContent.classList.remove("hidden");
 
