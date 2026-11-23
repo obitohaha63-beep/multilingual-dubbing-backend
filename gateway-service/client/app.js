@@ -886,12 +886,18 @@ class TourStateManager {
       return;
     }
 
-    candidatesList.innerHTML = candidates.map(c => `
-      <div class="candidate-item">
-        <strong>${c.name}</strong> (${c.distance_m ? Math.round(c.distance_m) + "m" : "--"})
-        <br><small>${t("Bán kính kích hoạt:")} ${c.radius || 80}m | ${t("Nguồn:")} ${c.source || "manual"}</small>
-      </div>
-    `).join("");
+    candidatesList.innerHTML = candidates.map((c, index) => {
+      const isNearest = index === 0;
+      return `
+        <div class="candidate-item ${isNearest ? "candidate-nearest" : ""}">
+          <div class="candidate-header">
+            <strong>${c.name}</strong> (${c.distance_m ? Math.round(c.distance_m) + "m" : "--"})
+            ${isNearest ? `<span class="badge badge-warning candidate-badge">${t("Gần nhất")}</span>` : ""}
+          </div>
+          <small>${t("Bán kính kích hoạt:")} ${c.radius || 80}m | ${t("Nguồn:")} ${c.source || "manual"}</small>
+        </div>
+      `;
+    }).join("");
   }
 
   function startTracking() {
